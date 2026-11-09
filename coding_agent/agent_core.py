@@ -34,7 +34,7 @@ def run_turn(
     prompt: str,
     *,
     request_model: RequestModel,
-    dispatch: Callable[[dict], ToolResult | str],
+    dispatch: Callable[[dict], ToolResult | str] | None = None,
     emit: EventHandler,
     max_tool_rounds: int,
     prepare: Callable[[list[dict]], list[dict]] | None = None,
@@ -42,8 +42,11 @@ def run_turn(
     session_id: str | None = None,
     prepare_with_events: Callable[[list[dict], EventHandler], list[dict]] | None = None,
     checkpoint: Callable[[dict, list[dict]], None] | None = None,
+    dispatch_with_events: Callable[[dict, EventHandler], ToolResult | str] | None = None,
 ) -> str:
     """Append a turn to history and report progress via structured events."""
+    if dispatch is None and dispatch_with_events is None:
+        raise ValueError("run_turn requires a tool dispatcher")
     scope = {"session_id": session_id or uuid4().hex, "turn_id": uuid4().hex}
 
     def publish(event: dict, *, durable: bool = False) -> None:
@@ -101,7 +104,13 @@ def run_turn(
                 tool_scope = {"call": call, "tool_call_id": call["id"], "round": round_number + 1}
                 publish({"type": "tool_request", **tool_scope}, durable=True)
                 started = perf_counter()
-                result = dispatch(call)
+                if dispatch_with_events is not None:
+                    def publish_tool(event: dict) -> None:
+                        publish({**event, "tool_call_id": call["id"], "round": round_number + 1})
+
+                    result = dispatch_with_events(call, publish_tool)
+                else:
+                    result = dispatch(call)
                 elapsed_ms = round((perf_counter() - started) * 1000)
                 if isinstance(result, str):
                     result = ToolResult(result)

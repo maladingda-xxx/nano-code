@@ -34,6 +34,8 @@ nano-code --env-file /path/to/nano.env
 
 交互模式中，同一轮内相同目录和参数的命令共享一次授权。授权后的程序拥有当前用户的进程权限。文件工具限制在工作区，命令的工作目录也在工作区内。
 
+长命令运行时会显示程序已经刷新的 stdout 和 stderr。通过 `COMMAND_TIMEOUT_SECONDS` 可以设置命令默认超时和上限，默认 60 秒。工具请求可用 `timeout_seconds` 选择更短的时间。命令超时或按 `Ctrl+C` 时，Nano Code 会结束受管的进程树并保留已收到的输出。超时和取消的验证结果会标为不确定。
+
 每轮结束时显示最近一次验证的结果。模型通过 `execute_command` 的 `verification: true` 标记测试或构建等验证命令，Nano Code 根据实际退出码判断通过或失败。验证后成功调用内置文件编辑或写入时，需要重新验证。
 
 在模型或工具运行期间按 `Ctrl+C` 可以结束本轮并回到输入框。会话保存在仓库根目录的 `.coding_agent_sessions.db`，下次启动可以选择恢复。SQLite 中的文件快照可能包含源文件的旧内容。
@@ -54,7 +56,7 @@ nano-code -p '列出这个仓库的测试入口'
 nano-code -p '修复失败的测试并验证' --json --allow-command '["python","-m","pytest"]'
 ```
 
-`--json` 每行输出一个事件，包括模型文本、工具请求、工具结果和 `turn_end`。默认拒绝运行外部命令，可重复使用 `--allow-command`，按仓库根目录与完整参数数组精确授权。命令参数数组要作为一个完整参数传入。
+`--json` 每行输出一个事件，包括模型文本、工具请求、实时命令输出、工具结果和 `turn_end`。纯文本脚本模式将实时命令输出发到 stderr，模型最终回复发到 stdout。默认拒绝运行外部命令，可重复使用 `--allow-command`，按仓库根目录与完整参数数组精确授权。命令参数数组要作为一个完整参数传入。
 
 单次命令也记录工具执行过程。发现未结束的轮次时，`--json` 通过 `recovery_pending` 提供轮次 ID 和工具状态，当前请求仍从自己的提示开始。可切换到交互模式恢复旧轮次。
 
@@ -62,6 +64,7 @@ nano-code -p '修复失败的测试并验证' --json --allow-command '["python",
 
 | 事件 | 字段 |
 | --- | --- |
+| `tool_output` | `stream` 为 `stdout` 或 `stderr`，`text` 是刚收到的输出片段 |
 | `tool_result` | `result` 提供易读文本，`outcome` 提供工具状态、退出码、stdout、stderr、耗时毫秒数和截断标记 |
 | `turn_end` | `status` 表示完成回复、调用出错或中断。 `reason` 提供具体结束原因，包括工具轮数耗尽和无工具降级 |
 | `turn_end.verification` | 记录本轮最近一次显式验证命令及状态。状态包括 `passed`、`failed`、`not_run`、`inconclusive` 和 `stale` |

@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import replace
 from functools import partial
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 from uuid import uuid4
 
@@ -503,7 +504,10 @@ def compress_messages(
     return compressed
 
 
-def execute_tool_call(call: dict, *, confirm=None, interactive: bool = False) -> ToolResult:
+def execute_tool_call(
+    call: dict, emit: EventHandler | None = None, *,
+    confirm=None, interactive: bool = False, command_timeout: float = 60,
+) -> ToolResult:
     name = call["function"]["name"]
     if name not in AVAILABLE_TOOLS:
         return ToolResult(f"错误：未知工具 {name}。", status="error")
@@ -522,7 +526,13 @@ def execute_tool_call(call: dict, *, confirm=None, interactive: bool = False) ->
             if not isinstance(flag, bool):
                 raise ToolInputError("verification 必须为布尔值。")
             is_verification = flag
-            result = run_command(**arguments, confirm=confirm)
+            def on_output(stream: str, text: str) -> None:
+                emit({"type": "tool_output", "stream": stream, "text": text})
+
+            result = run_command(
+                **arguments, confirm=confirm, timeout_limit=command_timeout,
+                on_output=on_output if emit else None,
+            )
         else:
             result = ToolResult(
                 AVAILABLE_TOOLS[name](**arguments),
@@ -555,14 +565,23 @@ def execute_tool_call(call: dict, *, confirm=None, interactive: bool = False) ->
 
 def _terminal_events():
     streaming_text = False
+    streamed_command = False
 
     def emit(event: dict) -> None:
-        nonlocal streaming_text
+        nonlocal streaming_text, streamed_command
         kind = event["type"]
         if kind == "text_delta":
             console.print(Text(event["text"]), end="")
             sys.stdout.flush()
             streaming_text = True
+            return
+        if kind == "tool_output":
+            text = event["text"]
+            style = "yellow" if event["stream"] == "stderr" else ""
+            console.print(Text(text, style), end="", soft_wrap=True)
+            sys.stdout.flush()
+            streaming_text = not text.endswith(("\n", "\r"))
+            streamed_command = True
             return
         if streaming_text:
             console.print()
@@ -571,13 +590,14 @@ def _terminal_events():
         if kind == "model_start":
             console.print(f"  [dim]思考中（第 {event['round']} 轮）[/dim]")
         elif kind == "tool_request":
+            streamed_command = False
             function = event["call"]["function"]
             console.print(Text(f"  🔧 {function['name']} {function['arguments'][:160]}", "cyan"))
         elif kind == "tool_result":
             function = event["call"]["function"]
             result = event["result"]
             if function["name"] in {"edit_file", "execute_command"} or event["outcome"]["status"] != "ok":
-                console.print(Text(result))
+                console.print(Text(result.split("\n", 1)[0] if streamed_command else result))
             else:
                 console.print(f"  [dim]返回 {len(result)} 字符[/dim]")
         elif kind == "usage":
@@ -640,7 +660,7 @@ def _report_pending_executions(emit: EventHandler, *, show_arguments: bool = Fal
     return bool(pending)
 
 
-def _interactive_dispatch():
+def _interactive_dispatch(command_timeout: float):
     approvals = {}
 
     def confirm(argv: list[str], cwd: Path) -> bool:
@@ -651,11 +671,12 @@ def _interactive_dispatch():
             approvals[key] = answer == "y"
         return approvals[key]
 
-    return partial(execute_tool_call, confirm=confirm, interactive=True)
+    return partial(execute_tool_call, confirm=confirm, interactive=True, command_timeout=command_timeout)
 
 
 def _run_interactive(
     messages: list[dict], model: ChatModel, root: Path, max_rounds: int, context_limit: int,
+    command_timeout: float,
 ) -> int:
     print_banner(model, root, max_rounds, context_limit)
     system = messages[0]
@@ -731,7 +752,8 @@ def _run_interactive(
         else:
             emit = _terminal_events()
             run_turn(
-                messages, user_input, request_model=model, dispatch=_interactive_dispatch(),
+                messages, user_input, request_model=model,
+                dispatch_with_events=_interactive_dispatch(command_timeout),
                 emit=emit, max_tool_rounds=max_rounds, save=auto_save,
                 session_id=session_id, checkpoint=record_execution,
                 prepare_with_events=lambda history, publish: compress_messages(
@@ -776,8 +798,11 @@ def main(argv: list[str] | None = None) -> int:
         context_limit = int(os.getenv("CONTEXT_LIMIT_TOKENS", "80000"))
         attempts = int(os.getenv("MAX_RETRIES", "3"))
         retry_delay = float(os.getenv("RETRY_BASE_DELAY", "1"))
+        command_timeout = float(os.getenv("COMMAND_TIMEOUT_SECONDS", "60"))
         if max_rounds < 0 or context_limit <= 0 or attempts <= 0 or retry_delay < 0:
             raise ValueError("轮数、上下文上限和重试配置超出范围。")
+        if not isfinite(command_timeout) or command_timeout <= 0:
+            raise ValueError("COMMAND_TIMEOUT_SECONDS 必须为大于 0 的有限数值。")
         model = ChatModel(
             OpenAI(
                 api_key=key, base_url=os.getenv("BASE_URL", "https://api.deepseek.com"),
@@ -798,13 +823,16 @@ def main(argv: list[str] | None = None) -> int:
     set_workspace_root(root)
     messages = [{"role": "system", "content": build_system_prompt(root, directory)}]
     if args.prompt is None:
-        return _run_interactive(messages, model, root, max_rounds, context_limit)
+        return _run_interactive(messages, model, root, max_rounds, context_limit, command_timeout)
 
     def emit(event: dict) -> None:
         if args.json:
             print(json.dumps(event), flush=True)
         elif event["type"] == "reply":
             console.print(Text(event["text"]))
+        elif event["type"] == "tool_output":
+            error_console.print(Text(event["text"]), end="", soft_wrap=True)
+            sys.stderr.flush()
         elif event["type"] in {"error", "recovery_error"}:
             error_console.print(Text(event["text"], "red"))
         elif event["type"] == "recovery_pending":
@@ -818,7 +846,8 @@ def main(argv: list[str] | None = None) -> int:
     _report_pending_executions(emit)
     status = run_turn(
         messages, args.prompt, request_model=model,
-        dispatch=partial(execute_tool_call, confirm=confirm), emit=emit, max_tool_rounds=max_rounds,
+        dispatch_with_events=partial(execute_tool_call, confirm=confirm, command_timeout=command_timeout),
+        emit=emit, max_tool_rounds=max_rounds,
         checkpoint=record_execution,
     )
     return {"completed": 0, "error": 1, "interrupted": 130}[status]

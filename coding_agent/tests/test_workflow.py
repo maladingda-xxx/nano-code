@@ -2,6 +2,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,7 +16,7 @@ import tools
 from agent_core import ModelReply, run_turn
 from changes import undo_last_edit
 from exceptions import AgentAPIError, ToolInputError, ToolSecurityError, TurnPersistenceError
-from execution_store import pending_executions, record_execution, recover_execution
+from execution_store import _process_running, pending_executions, record_execution, recover_execution
 from model_api import ChatModel
 from workspace import find_root, read_project_instructions
 
@@ -223,13 +224,20 @@ def test_json_reports_verification_independently_of_cli_exit(workspace, monkeypa
         assert request[key] == result[key]
     outcome = result["outcome"]
     assert outcome["elapsed_ms"] >= 0
+    output_events = [event for event in events if event["type"] == "tool_output"]
     if allowed:
+        assert {event["stream"] for event in output_events} == {"stdout", "stderr"}
+        for event in output_events:
+            assert events.index(request) < events.index(event) < events.index(result)
+            for key in ("session_id", "turn_id", "round", "tool_call_id"):
+                assert event[key] == result[key]
         assert outcome["status"] == "failed"
         assert outcome["exit_code"] == 3
         assert outcome["stdout"].startswith("…（前文已截断）")
         assert outcome["stderr"].strip() == "failure"
         assert outcome["truncated"]
     else:
+        assert not output_events
         assert outcome["status"] == "denied"
         assert outcome["exit_code"] is None
     assert events[-1]["verification"]["status"] == ("failed" if allowed else "not_run")
@@ -559,3 +567,84 @@ input()
             process.wait(timeout=10)
 
     assert recover_execution("live") == [{"role": "user", "content": "work"}]
+
+
+def test_command_streams_before_exit_in_target_directory(workspace, monkeypatch):
+    project = workspace / "project"
+    project.mkdir()
+    monkeypatch.setenv("NANO_TEST_COMMAND_ENV", "available")
+    script = """
+import os
+import sys
+import time
+from pathlib import Path
+
+prefix = "开始".encode("utf-8")
+os.write(1, prefix[:1])
+time.sleep(0.1)
+os.write(1, prefix[1:])
+print(f"ready:{Path.cwd().name}:{os.environ['NANO_TEST_COMMAND_ENV']}", flush=True)
+while not Path("ack").exists():
+    time.sleep(0.01)
+print("done", file=sys.stderr, flush=True)
+"""
+    output = {"stdout": "", "stderr": ""}
+
+    def on_output(stream, text):
+        output[stream] += text
+        if "ready:project:available" in output["stdout"]:
+            (project / "ack").touch()
+
+    result = tools.run_command(
+        argv=["python", "-c", script], cwd="project", timeout_seconds=5,
+        confirm=lambda argv, directory: directory == project, on_output=on_output,
+    )
+    assert result.status == "ok"
+    assert output["stdout"].startswith("开始ready:project:available")
+    assert output["stderr"].strip() == "done"
+    assert result.stdout == output["stdout"]
+    assert result.stderr == output["stderr"]
+
+
+@pytest.mark.parametrize("stop", ["timeout", "interrupted"])
+def test_command_stops_child_process_tree(workspace, stop):
+    script = """
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
+print(child.pid, flush=True)
+time.sleep(15)
+"""
+    call = tool_call(
+        "command", "execute_command", argv=["python", "-c", script],
+        timeout_seconds=2, verification=True,
+    )
+
+    def emit(event):
+        if stop == "interrupted" and event["stream"] == "stdout":
+            raise KeyboardInterrupt
+
+    result = agent.execute_tool_call(call, emit, confirm=lambda *_: True, command_timeout=3)
+    assert result.status == stop, result.text
+    assert result.exit_code is None
+    assert result.verification == "inconclusive"
+    pid = int(result.stdout.strip())
+    deadline = time.monotonic() + 3
+    while _process_running(pid):
+        if sys.platform == "linux":
+            try:
+                if Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].startswith("Z "):
+                    break
+            except FileNotFoundError:
+                break
+        assert time.monotonic() < deadline, f"child process {pid} survived {stop}"
+        time.sleep(0.02)
+
+
+def test_command_timeout_cannot_exceed_user_limit(workspace):
+    argv = ["python", "-c", "from pathlib import Path; Path('created').touch()"]
+    with pytest.raises(ToolInputError, match="不超过 2 秒"):
+        tools.run_command(argv=argv, timeout_seconds=3, timeout_limit=2, confirm=lambda *_: True)
+    assert not (workspace / "created").exists()

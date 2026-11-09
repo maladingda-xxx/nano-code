@@ -8,18 +8,17 @@ tools.py —— Coding Agent 的工具系统
 """
 
 import difflib
-import locale
 import os
 import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
 from agent_core import ToolResult
 from changes import read_bytes, record_edit
+from command_runner import run_process
 from session_store import set_session_root
 from workspace import workspace_path
 
@@ -370,19 +369,6 @@ _BLOCKED_PROGRAMS = {
 _SHELL_OPERATORS = {"&", "&&", "|", "||", ";", "<", ">", ">>"}
 
 
-def _command_output(stream) -> tuple[str, bool]:
-    size = stream.seek(0, os.SEEK_END)
-    stream.seek(max(0, size - 14_000))
-    data = stream.read()
-    try:
-        output = data.decode("utf-8")
-    except UnicodeDecodeError:
-        output = data.decode(locale.getpreferredencoding(False), errors="replace")
-    if size > len(data) or len(output) > 3500:
-        return "…（前文已截断）\n" + output[-3500:], True
-    return output, False
-
-
 def execute_command(
     command: str | None = None,
     *,
@@ -390,7 +376,12 @@ def execute_command(
     cwd: str = ".",
     confirm: Callable[[list[str], Path], bool] | None = None,
 ) -> str:
-    return run_command(command, argv=argv, cwd=cwd, confirm=confirm).text
+    result = run_command(command, argv=argv, cwd=cwd, confirm=confirm)
+    if result.status == "timeout":
+        raise ToolTimeoutError(result.text, tool_name="execute_command")
+    if result.status == "interrupted":
+        raise KeyboardInterrupt
+    return result.text
 
 
 def run_command(
@@ -399,6 +390,9 @@ def run_command(
     argv: list[str] | None = None,
     cwd: str = ".",
     confirm: Callable[[list[str], Path], bool] | None = None,
+    timeout_seconds: float | None = None,
+    timeout_limit: float = 60,
+    on_output: Callable[[str, str], None] | None = None,
 ) -> ToolResult:
     """Run one explicitly approved executable and report its status and output."""
     tool = "execute_command"
@@ -412,6 +406,9 @@ def run_command(
         any(not isinstance(arg, str) or "\0" in arg for arg in argv) or not argv[0].strip()
     ):
         raise ToolInputError("argv 必须是非空的程序及参数数组。", tool_name=tool)
+    timeout = timeout_limit if timeout_seconds is None else timeout_seconds
+    if type(timeout) not in (int, float) or not 0 < timeout <= timeout_limit:
+        raise ToolInputError(f"命令超时须大于 0 且不超过 {timeout_limit:g} 秒。", tool_name=tool)
     directory = workspace_path(_workspace_root, cwd, tool)
     if not directory.is_dir():
         raise ToolInputError("cwd 必须是工作区内的目录。", tool_name=tool)
@@ -431,27 +428,9 @@ def run_command(
         return ToolResult("命令未获授权，未执行。", status="denied")
 
     try:
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            result = subprocess.run(
-                [executable, *argv[1:]], cwd=directory, stdin=subprocess.DEVNULL,
-                stdout=stdout, stderr=stderr, timeout=60,
-            )
-            stdout_text, stdout_truncated = _command_output(stdout)
-            stderr_text, stderr_truncated = _command_output(stderr)
-    except subprocess.TimeoutExpired as error:
-        raise ToolTimeoutError("命令执行超过 60 秒。", tool_name=tool) from error
+        return run_process([executable, *argv[1:]], directory, timeout, on_output)
     except OSError as error:
         raise ToolExecutionError(f"无法执行命令: {error}", tool_name=tool) from error
-
-    parts = [f"退出码: {result.returncode}"]
-    for label, output in (("stdout", stdout_text), ("stderr", stderr_text)):
-        if output:
-            parts.append(f"[{label}]\n{output.rstrip()}")
-    return ToolResult(
-        "\n".join(parts), status="ok" if result.returncode == 0 else "failed",
-        exit_code=result.returncode, stdout=stdout_text, stderr=stderr_text,
-        truncated=stdout_truncated or stderr_truncated,
-    )
 
 
 def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
@@ -659,6 +638,10 @@ TOOLS: list[dict] = [
                         "description": "程序名与参数，例如 [\"python\", \"-m\", \"pytest\"]",
                     },
                     "cwd": {"type": "string", "description": "工作区内的目录，默认仓库根目录"},
+                    "timeout_seconds": {
+                        "type": "number", "exclusiveMinimum": 0,
+                        "description": "可指定更短的超时，默认使用用户设置的命令超时上限。",
+                    },
                     "verification": {
                         "type": "boolean",
                         "description": "用于验证任务结果的命令填 true，例如运行测试或构建。",

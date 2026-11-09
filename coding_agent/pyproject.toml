@@ -30,7 +30,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["agent", "agent_core", "changes", "exceptions", "model_api", "session_store", "tools", "workspace"]
+py-modules = ["agent", "agent_core", "changes", "exceptions", "execution_store", "model_api", "session_store", "tools", "workspace"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

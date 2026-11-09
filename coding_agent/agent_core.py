@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from time import perf_counter
 from uuid import uuid4
 
-from exceptions import AgentAPIError, ModelResponseError
+from exceptions import AgentAPIError, ModelResponseError, TurnPersistenceError
 
 EventHandler = Callable[[dict], None]
 RequestModel = Callable[[list[dict], bool, EventHandler], "ModelReply"]
@@ -41,12 +41,16 @@ def run_turn(
     save: Callable[[list[dict]], object] | None = None,
     session_id: str | None = None,
     prepare_with_events: Callable[[list[dict], EventHandler], list[dict]] | None = None,
+    checkpoint: Callable[[dict, list[dict]], None] | None = None,
 ) -> str:
     """Append a turn to history and report progress via structured events."""
     scope = {"session_id": session_id or uuid4().hex, "turn_id": uuid4().hex}
 
-    def publish(event: dict) -> None:
-        emit({**event, **scope})
+    def publish(event: dict, *, durable: bool = False) -> None:
+        scoped = {**event, **scope}
+        if durable and checkpoint:
+            checkpoint(scoped, messages)
+        emit(scoped)
 
     messages.append({"role": "user", "content": prompt})
     status = "completed"
@@ -56,6 +60,8 @@ def run_turn(
     batch = None
     batch_index = 0
     try:
+        if checkpoint:
+            publish({"type": "turn_start"}, durable=True)
         if prepare_with_events:
             messages[:] = prepare_with_events(messages, publish)
         elif prepare:
@@ -81,7 +87,7 @@ def run_turn(
                 if not reply.text or not reply.text.strip():
                     raise ModelResponseError("模型未返回有效文本。", reason="empty_response")
                 messages.append({"role": "assistant", "content": reply.text})
-                publish({"type": "reply", "text": reply.text})
+                publish({"type": "reply", "text": reply.text}, durable=True)
                 break
 
             pending = list(reply.tool_calls)
@@ -93,7 +99,7 @@ def run_turn(
             while pending:
                 call = pending[0]
                 tool_scope = {"call": call, "tool_call_id": call["id"], "round": round_number + 1}
-                publish({"type": "tool_request", **tool_scope})
+                publish({"type": "tool_request", **tool_scope}, durable=True)
                 started = perf_counter()
                 result = dispatch(call)
                 elapsed_ms = round((perf_counter() - started) * 1000)
@@ -115,12 +121,19 @@ def run_turn(
                 publish({
                     "type": "tool_result", **tool_scope, "result": result.text,
                     "outcome": {**outcome, "elapsed_ms": elapsed_ms},
-                })
+                }, durable=True)
                 if result.status == "interrupted":
                     raise KeyboardInterrupt
-    except KeyboardInterrupt:
-        status = "interrupted"
-        reason = "user_interrupt"
+    except (KeyboardInterrupt, TurnPersistenceError) as error:
+        if isinstance(error, TurnPersistenceError):
+            status = "error"
+            reason = "persistence_error"
+            publish({"type": "error", "reason": reason, "text": str(error)})
+            pending_text = "执行记录保存失败。先检查工作区和执行记录，再决定是否重试。"
+        else:
+            status = "interrupted"
+            reason = "user_interrupt"
+            pending_text = "用户中断了本轮。请先检查当前工作区，再判断是否需要重试。"
         if batch_index < len(messages) and messages[batch_index] is batch:
             completed_ids = {
                 message["tool_call_id"] for message in messages[batch_index + 1:]
@@ -131,15 +144,23 @@ def run_turn(
                     continue
                 messages.append({
                     "role": "tool", "tool_call_id": call["id"],
-                    "content": "用户中断了本轮。请先检查当前工作区，再判断是否需要重试。",
+                    "content": pending_text,
                 })
     except AgentAPIError as error:
         status = "error"
         reason = error.reason if isinstance(error, ModelResponseError) else "api_error"
         publish({"type": "error", "reason": reason, "text": str(error)})
     finally:
-        if save:
-            save(messages)
+        if save and reason != "persistence_error" and save(messages) is False:
+            status = "error"
+            reason = "persistence_error"
+            publish({"type": "error", "reason": reason, "text": "无法自动保存会话。"})
 
-    publish({"type": "turn_end", "status": status, "reason": reason, "verification": verification})
+    end = {"type": "turn_end", "status": status, "reason": reason, "verification": verification}
+    try:
+        publish(end, durable=reason != "persistence_error")
+    except TurnPersistenceError as error:
+        status = "error"
+        publish({"type": "error", "reason": "persistence_error", "text": str(error)})
+        publish({**end, "status": status, "reason": "persistence_error"})
     return status

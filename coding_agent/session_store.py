@@ -94,54 +94,7 @@ def save_session(name: str, messages: list[dict]) -> bool:
         _ensure_tables(conn)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("BEGIN IMMEDIATE")
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # 检查是否存在同名会话
-        existing = conn.execute(
-            "SELECT id FROM sessions WHERE name = ?", (name,)
-        ).fetchone()
-
-        if existing:
-            session_id = existing[0]
-            # 删除旧消息
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            conn.execute(
-                "UPDATE sessions SET updated_at = ?, message_count = ? WHERE id = ?",
-                (now, 0, session_id),
-            )
-        else:
-            cursor = conn.execute(
-                "INSERT INTO sessions (name, created_at, updated_at, message_count) VALUES (?, ?, ?, ?)",
-                (name, now, now, 0),
-            )
-            session_id = cursor.lastrowid
-
-        # 插入消息
-        for seq, msg in enumerate(messages):
-            tool_calls_json = None
-            if msg.get("tool_calls"):
-                tool_calls_json = json.dumps(msg["tool_calls"], ensure_ascii=False)
-
-            conn.execute(
-                """INSERT INTO messages
-                   (session_id, seq, role, content, tool_calls, tool_call_id, name, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    seq,
-                    msg.get("role", ""),
-                    msg.get("content"),
-                    tool_calls_json,
-                    msg.get("tool_call_id"),
-                    msg.get("name"),
-                    now,
-                ),
-            )
-
-        conn.execute(
-            "UPDATE sessions SET updated_at = ?, message_count = ? WHERE id = ?",
-            (now, len(messages), session_id),
-        )
+        _write_session(conn, name, messages)
         conn.commit()
         return True
     except (sqlite3.Error, TypeError, ValueError) as e:
@@ -150,6 +103,57 @@ def save_session(name: str, messages: list[dict]) -> bool:
     finally:
         if conn is not None:
             conn.close()
+
+
+def _write_session(conn: sqlite3.Connection, name: str, messages: list[dict]) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 检查是否存在同名会话
+    existing = conn.execute(
+        "SELECT id FROM sessions WHERE name = ?", (name,)
+    ).fetchone()
+
+    if existing:
+        session_id = existing[0]
+        # 删除旧消息
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?, message_count = ? WHERE id = ?",
+            (now, 0, session_id),
+        )
+    else:
+        cursor = conn.execute(
+            "INSERT INTO sessions (name, created_at, updated_at, message_count) VALUES (?, ?, ?, ?)",
+            (name, now, now, 0),
+        )
+        session_id = cursor.lastrowid
+
+    # 插入消息
+    for seq, msg in enumerate(messages):
+        tool_calls_json = None
+        if msg.get("tool_calls"):
+            tool_calls_json = json.dumps(msg["tool_calls"], ensure_ascii=False)
+
+        conn.execute(
+            """INSERT INTO messages
+               (session_id, seq, role, content, tool_calls, tool_call_id, name, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                seq,
+                msg.get("role", ""),
+                msg.get("content"),
+                tool_calls_json,
+                msg.get("tool_call_id"),
+                msg.get("name"),
+                now,
+            ),
+        )
+
+    conn.execute(
+        "UPDATE sessions SET updated_at = ?, message_count = ? WHERE id = ?",
+        (now, len(messages), session_id),
+    )
 
 
 # ============================================================

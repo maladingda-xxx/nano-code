@@ -1,6 +1,8 @@
 import json
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -12,7 +14,8 @@ import session_store
 import tools
 from agent_core import ModelReply, run_turn
 from changes import undo_last_edit
-from exceptions import AgentAPIError, ToolInputError, ToolSecurityError
+from exceptions import AgentAPIError, ToolInputError, ToolSecurityError, TurnPersistenceError
+from execution_store import pending_executions, record_execution, recover_execution
 from model_api import ChatModel
 from workspace import find_root, read_project_instructions
 
@@ -407,3 +410,152 @@ def test_invalid_tool_arguments_are_reported_to_model(workspace):
     result = next(event for event in events if event["type"] == "tool_result")
     assert result["outcome"]["status"] == "invalid_arguments"
     assert not (workspace / "x").exists()
+
+
+@pytest.mark.parametrize(("crash_after", "expected"), [
+    ("read", ["ok", "not_started", "not_started"]),
+    ("write", ["ok", "unknown", "not_started"]),
+    ("command", ["ok", "ok", "unknown"]),
+])
+def test_hard_exit_recovers_work_without_replaying_tools(
+    workspace, monkeypatch, capsys, crash_after, expected,
+):
+    (workspace / "source.txt").write_text("original")
+    script = """
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from agent import execute_tool_call
+from agent_core import ModelReply, run_turn
+from execution_store import record_execution
+from tools import set_workspace_root
+
+set_workspace_root(Path.cwd())
+crash_after = sys.argv[2]
+
+def call(call_id, name, **arguments):
+    return {"id": call_id, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+calls = [
+    call("read", "read_file", file_path="source.txt"),
+    call("write", "write_file", file_path="source.txt", content="+write", mode="append"),
+    call("command", "execute_command", argv=[
+        "python", "-c", "from pathlib import Path; p=Path('source.txt'); p.write_text(p.read_text()+'+command')",
+    ]),
+]
+
+def dispatch(tool):
+    result = execute_tool_call(tool, confirm=lambda *_: True)
+    assert result.status == "ok"
+    if tool["id"] == crash_after and crash_after != "read":
+        os._exit(73)
+    return result
+
+def emit(event):
+    if crash_after == "read" and event["type"] == "tool_result":
+        os._exit(73)
+
+run_turn([], "work", request_model=lambda *_: ModelReply(tool_calls=calls),
+         dispatch=dispatch, emit=emit, max_tool_rounds=1, checkpoint=record_execution)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(Path(agent.__file__).parent), crash_after],
+        cwd=workspace, capture_output=True, timeout=20,
+    )
+    assert completed.returncode == 73, completed.stderr
+    pending, = pending_executions()
+    assert not pending["active"]
+    assert [step["status"] for step in pending["tools"]] == expected
+
+    monkeypatch.setenv("API_KEY", "test")
+    answers = iter([f"/recover {pending['turn_id']}", "/exit"])
+    monkeypatch.setattr(agent.Prompt, "ask", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr(agent.ChatModel, "__call__", lambda *args: pytest.fail("恢复时调用了模型"))
+    assert agent.main([]) == 0
+
+    output = capsys.readouterr().out
+    assert "已恢复对话" in output
+    if "unknown" in expected:
+        assert "结果待核查" in output
+    if "not_started" in expected:
+        assert "未开始" in output
+    history = session_store.load_session("__auto__")
+    results = [message for message in history if message["role"] == "tool"]
+    assert [result["tool_call_id"] for result in results] == ["read", "write", "command"]
+    for result, state in zip(results, expected):
+        if state == "unknown":
+            assert "先核查" in result["content"]
+        elif state == "not_started":
+            assert "未开始" in result["content"]
+    suffix = {"read": "", "write": "+write", "command": "+write+command"}
+    assert (workspace / "source.txt").read_text() == "original" + suffix[crash_after]
+    assert pending_executions() == []
+
+
+def test_persistence_failure_stops_before_tool_dispatch(workspace):
+    calls = [tool_call("write", "write_file", file_path="x", content="unexpected")]
+
+    def checkpoint(event, messages):
+        if event["type"] == "tool_request":
+            raise TurnPersistenceError("disk unavailable")
+        record_execution(event, messages)
+
+    events = []
+    assert run_turn(
+        [], "hello", request_model=lambda *_: ModelReply(tool_calls=calls),
+        dispatch=agent.execute_tool_call, emit=events.append, max_tool_rounds=1,
+        checkpoint=checkpoint,
+    ) == "error"
+    assert events[-1]["reason"] == "persistence_error"
+    assert not (workspace / "x").exists()
+    assert len(pending_executions()) == 1
+
+
+def test_failed_autosave_preserves_final_reply_in_execution_record(workspace):
+    events = []
+    assert run_turn(
+        [], "hello", request_model=lambda *_: ModelReply("final reply"),
+        dispatch=agent.execute_tool_call, emit=events.append, max_tool_rounds=1,
+        save=lambda _: False, checkpoint=record_execution,
+    ) == "error"
+    assert events[-1]["reason"] == "persistence_error"
+    pending, = pending_executions()
+    assert recover_execution(pending["turn_id"]) == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "final reply"},
+    ]
+    assert pending_executions() == []
+
+
+def test_recovery_waits_for_owner_process_to_exit(workspace):
+    script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from execution_store import record_execution
+
+record_execution(
+    {"type": "turn_start", "session_id": "session", "turn_id": "live"},
+    [{"role": "user", "content": "work"}],
+)
+print("ready", flush=True)
+input()
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(Path(agent.__file__).parent)],
+        cwd=workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    ) as process:
+        try:
+            assert process.stdout.readline().strip() == "ready"
+            pending, = pending_executions()
+            assert pending["active"]
+            with pytest.raises(TurnPersistenceError, match="可能仍在运行"):
+                recover_execution("live")
+        finally:
+            process.stdin.close()
+            process.wait(timeout=10)
+
+    assert recover_execution("live") == [{"role": "user", "content": "work"}]

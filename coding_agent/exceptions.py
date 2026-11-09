@@ -45,3 +45,7 @@ class ModelResponseError(AgentAPIError):
     def __init__(self, message: str, *, reason: str):
         super().__init__(message)
         self.reason = reason
+
+
+class TurnPersistenceError(Exception):
+    """An execution checkpoint could not be saved or recovered."""

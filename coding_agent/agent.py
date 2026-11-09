@@ -28,7 +28,10 @@ from rich.text import Text
 
 from agent_core import EventHandler, ToolResult, run_turn
 from changes import undo_last_edit
-from exceptions import AgentAPIError, ToolError, ToolInputError, ToolSecurityError, ToolTimeoutError
+from exceptions import (
+    AgentAPIError, ToolError, ToolInputError, ToolSecurityError, ToolTimeoutError, TurnPersistenceError,
+)
+from execution_store import pending_executions, record_execution, recover_execution
 from model_api import ChatModel
 from session_store import auto_save, list_saved_sessions, load_session, save_session
 from tools import AVAILABLE_TOOLS, TOOLS, run_command, set_workspace_root
@@ -51,8 +54,8 @@ def print_banner(model: ChatModel, root: Path, max_rounds: int, context_limit: i
     info_table.add_row("最大工具轮数", str(max_rounds))
     info_table.add_row("上下文上限", f"{context_limit:,} tokens")
     info_table.add_row("流式输出", "开启" if model.streaming else "关闭")
-    info_table.add_row("Temperature", str(TEMPERATURE))
-    info_table.add_row("Top-P", str(TOP_P))
+    info_table.add_row("Temperature", str(model.temperature))
+    info_table.add_row("Top-P", str(model.top_p))
 
     console.print()
     console.print(Panel(
@@ -87,6 +90,7 @@ def print_help():
   /load      加载一个命名存档（替换当前会话）
   /sessions  列出所有已保存的会话
   /undo      撤销最近一次内置文件修改
+  /recover   查看未结束的轮次，或用 /recover <轮次 ID> 恢复
 
 [bold]可用工具（由模型自动调用）:[/bold]
 
@@ -336,6 +340,7 @@ def build_system_prompt(root: Path, directory: Path) -> str:
 修改已有代码优先使用 edit_file，创建文件可用 write_file。文件工具的相对路径以仓库根目录为基准。
 需要运行测试或构建来验证结果时，使用 execute_command 的 argv 数组并设置 verification=true，一次提交一条命令。
 命令被拒绝时不要通过其他命令绕过。依据实际退出码和输出汇报验证结果。
+若会话记录标记了上轮结果待核查的操作，先核查工作区和命令效果，再决定是否需要重试。
 需求不明确时可使用 ask_followup_question。优先给出简洁、可核查的结论。"""
     if instructions:
         prompt += (
@@ -577,8 +582,10 @@ def _terminal_events():
                 console.print(f"  [dim]返回 {len(result)} 字符[/dim]")
         elif kind == "usage":
             console.print(f"  [dim]用量 {event['total_tokens']} tokens[/dim]")
-        elif kind in {"error", "notice"}:
-            console.print(Text(event["text"], "red" if kind == "error" else "yellow"))
+        elif kind in {"error", "notice", "recovery_error"}:
+            console.print(Text(event["text"], "yellow" if kind == "notice" else "red"))
+        elif kind == "recovery_pending":
+            _print_pending_execution(event, console)
         elif kind == "turn_end":
             if event["status"] == "interrupted":
                 console.print("  [yellow]本轮已中断，可以继续输入。[/yellow]")
@@ -594,6 +601,43 @@ def _terminal_events():
             console.print(Text(f"  {label}", style))
 
     return emit
+
+
+def _print_pending_execution(event: dict, output: Console) -> None:
+    state = "所属进程可能仍在运行" if event["active"] else "可在交互模式用 /recover 恢复"
+    output.print(Text(f"未结束轮次 {event['turn_id']}（{state}）", "yellow"))
+    for step in event["tools"]:
+        label = {
+            "unknown": "结果待核查", "not_started": "未开始",
+            "ok": "已有结果", "failed": "执行失败",
+        }.get(step["status"], step["status"])
+        detail = step["name"]
+        if "arguments" in step:
+            detail += " " + step["arguments"][:240]
+        if step["exit_code"] is not None:
+            detail += f"（退出码 {step['exit_code']}）"
+        output.print(Text(f"  {label} · {detail}"))
+
+
+def _report_pending_executions(emit: EventHandler, *, show_arguments: bool = False) -> bool:
+    try:
+        pending = pending_executions()
+    except TurnPersistenceError as error:
+        emit({"type": "recovery_error", "text": str(error)})
+        return True
+    for execution in pending:
+        steps = []
+        for step in execution["tools"]:
+            call = step["call"]
+            summary = {
+                "name": call["function"]["name"], "tool_call_id": call["id"],
+                "status": step["status"], "exit_code": step["exit_code"],
+            }
+            if show_arguments:
+                summary["arguments"] = call["function"]["arguments"]
+            steps.append(summary)
+        emit({"type": "recovery_pending", **execution, "tools": steps})
+    return bool(pending)
 
 
 def _interactive_dispatch():
@@ -615,6 +659,7 @@ def _run_interactive(
 ) -> int:
     print_banner(model, root, max_rounds, context_limit)
     system = messages[0]
+    _report_pending_executions(_terminal_events(), show_arguments=True)
     saved = load_session("__auto__")
     if saved and Prompt.ask("恢复上次会话？", choices=["y", "n"], default="y") == "y":
         messages.extend(saved[1:] if saved[0]["role"] == "system" else saved)
@@ -645,6 +690,23 @@ def _run_interactive(
             print_stats(messages, session_start)
         elif command == "/sessions":
             print_sessions()
+        elif command == "/recover":
+            turn_id = name.strip()
+            if not turn_id:
+                if not _report_pending_executions(_terminal_events(), show_arguments=True):
+                    console.print("没有待恢复的轮次。")
+                continue
+            try:
+                recovered = recover_execution(turn_id)
+            except TurnPersistenceError as error:
+                console.print(Text(str(error), "red"))
+                continue
+            if recovered is None:
+                console.print("找不到待恢复的轮次。")
+                continue
+            messages[:] = [system, *(recovered[1:] if recovered[0]["role"] == "system" else recovered)]
+            session_id = uuid4().hex
+            console.print("已恢复对话。请先核查结果不确定的操作，再输入下一条指令。")
         elif command == "/undo":
             try:
                 console.print(Text(undo_last_edit(root)))
@@ -671,7 +733,7 @@ def _run_interactive(
             run_turn(
                 messages, user_input, request_model=model, dispatch=_interactive_dispatch(),
                 emit=emit, max_tool_rounds=max_rounds, save=auto_save,
-                session_id=session_id,
+                session_id=session_id, checkpoint=record_execution,
                 prepare_with_events=lambda history, publish: compress_messages(
                     history, context_limit, model, publish,
                 ),
@@ -743,17 +805,21 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(event), flush=True)
         elif event["type"] == "reply":
             console.print(Text(event["text"]))
-        elif event["type"] == "error":
+        elif event["type"] in {"error", "recovery_error"}:
             error_console.print(Text(event["text"], "red"))
+        elif event["type"] == "recovery_pending":
+            _print_pending_execution(event, error_console)
 
     allowed = set(args.allow_command)
 
     def confirm(command: list[str], cwd: Path) -> bool:
         return cwd == root and tuple(command) in allowed
 
+    _report_pending_executions(emit)
     status = run_turn(
         messages, args.prompt, request_model=model,
         dispatch=partial(execute_tool_call, confirm=confirm), emit=emit, max_tool_rounds=max_rounds,
+        checkpoint=record_execution,
     )
     return {"completed": 0, "error": 1, "interrupted": 130}[status]
 

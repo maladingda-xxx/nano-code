@@ -78,7 +78,7 @@ def run_turn(
             try:
                 reply = request_model(messages, allow_tools, publish)
             except AgentAPIError as error:
-                if not allow_tools or isinstance(error, ModelResponseError):
+                if not allow_tools or not error.allow_fallback:
                     raise
                 publish({"type": "notice", "text": "模型调用失败，正在尝试无工具模式。"})
                 reply = request_model(messages, False, publish)
@@ -157,7 +157,7 @@ def run_turn(
                 })
     except AgentAPIError as error:
         status = "error"
-        reason = error.reason if isinstance(error, ModelResponseError) else "api_error"
+        reason = error.reason
         publish({"type": "error", "reason": reason, "text": str(error)})
     finally:
         if save and reason != "persistence_error" and save(messages) is False:

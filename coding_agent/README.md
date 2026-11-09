@@ -38,6 +38,8 @@ nano-code --env-file /path/to/nano.env
 
 每轮结束时显示最近一次验证的结果。模型通过 `execute_command` 的 `verification: true` 标记测试或构建等验证命令，Nano Code 根据实际退出码判断通过或失败。验证后成功调用内置文件编辑或写入时，需要重新验证。
 
+交互和脚本模式的每次模型请求都按 `CONTEXT_LIMIT_TOKENS` 估算消息和工具定义的占用，并为回复预留空间。超预算时，本地裁剪优先保留项目说明、当前任务和最新的工具批次，长输出可保留首尾。旧轮次可从请求中移除，交互会话存档和进行中的恢复记录保留原文。工具调用及对应结果始终成批保留或移除。必要内容仍无法放入预算时，返回 `context_budget_exceeded`。[Chat Completions 工具消息格式](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+
 在模型或工具运行期间按 `Ctrl+C` 可以结束本轮并回到输入框。会话保存在仓库根目录的 `.coding_agent_sessions.db`，下次启动可以选择恢复。SQLite 中的文件快照可能包含源文件的旧内容。
 
 工具请求在运行前写入 SQLite，运行结束后记录状态和退出码。进程强制退出后，启动时会列出未结束的轮次。使用 `/recover <轮次 ID>` 可以恢复对话及已有工具结果。执行结果未落盘的操作会标为待核查，同批剩余操作会标为未开始。恢复只读取已保存的记录，继续任务前应先核查工作区和外部命令的实际效果。

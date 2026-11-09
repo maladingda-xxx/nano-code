@@ -7,6 +7,7 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from agent_core import EventHandler, ModelReply
+from context_budget import fit_request
 from exceptions import AgentAPIError, ModelResponseError
 
 
@@ -66,6 +67,7 @@ class ChatModel:
     def __init__(
         self, client: OpenAI, name: str, temperature: float, top_p: float,
         streaming: bool, max_attempts: int, retry_delay: float, tools: list[dict],
+        *, context_limit: int = 80000,
     ):
         self.client = client
         self.name = name
@@ -75,8 +77,13 @@ class ChatModel:
         self.max_attempts = max_attempts
         self.retry_delay = retry_delay
         self.tools = tools
+        self.context_limit = context_limit
 
     def _create(self, emit: EventHandler, **kwargs: Any) -> Any:
+        kwargs["messages"], kwargs["max_tokens"] = fit_request(
+            kwargs["messages"], kwargs.get("tools") or [], limit=self.context_limit,
+            max_output=kwargs["max_tokens"], emit=emit,
+        )
         for attempt in range(1, self.max_attempts + 1):
             try:
                 return self.client.chat.completions.create(model=self.name, **kwargs)

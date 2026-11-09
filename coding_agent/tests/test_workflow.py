@@ -11,6 +11,7 @@ import pytest
 from openai import OpenAI
 
 import agent
+import context_budget
 import session_store
 import tools
 from agent_core import ModelReply, run_turn
@@ -648,3 +649,101 @@ def test_command_timeout_cannot_exceed_user_limit(workspace):
     with pytest.raises(ToolInputError, match="不超过 2 秒"):
         tools.run_command(argv=argv, timeout_seconds=3, timeout_limit=2, confirm=lambda *_: True)
     assert not (workspace / "created").exists()
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_cli_checks_budget_after_each_tool_batch(workspace, monkeypatch, capsys, interactive):
+    monkeypatch.setattr(context_budget, "_encoding", lambda: None)
+    monkeypatch.setenv("API_KEY", "test")
+    monkeypatch.setenv("STREAMING_ENABLED", "false")
+    monkeypatch.setenv("CONTEXT_LIMIT_TOKENS", "6500")
+    monkeypatch.setenv("MAX_TOOL_ROUNDS", "4")
+    prompt = "check the current task"
+    long_output = "退出码: 1\n" + "x" * 7700 + "\nLAST-ERROR"
+    monkeypatch.setitem(
+        tools.AVAILABLE_TOOLS, "read_file",
+        lambda file_path: long_output if file_path != "small" else "new evidence",
+    )
+    first_calls = [
+        tool_call("a", "read_file", file_path="large"),
+        tool_call("b", "read_file", file_path="large"),
+    ]
+    latest_call = tool_call("c", "read_file", file_path="small")
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        messages = body["messages"]
+        assert messages[0] == requests[0]["messages"][0]
+        assert {"role": "user", "content": prompt} in messages
+        assert all(message.get("tool_call_id") != "old" for message in messages)
+        assert context_budget.estimate_tokens(messages) + body["max_tokens"] < 6500
+        if len(requests) == 1:
+            assert body["max_tokens"] == 1625
+            return _completion(None, "tool_calls", first_calls)
+        if len(requests) == 2:
+            assert messages[-3]["tool_calls"] == first_calls
+            assert [message["tool_call_id"] for message in messages[-2:]] == ["a", "b"]
+            for message in messages[-2:]:
+                assert "工具输出已压缩" in message["content"]
+                assert message["content"].startswith("退出码: 1")
+                assert message["content"].endswith("LAST-ERROR")
+            return _completion(None, "tool_calls", [latest_call])
+        assert messages[-2]["tool_calls"] == [latest_call]
+        assert messages[-1]["tool_call_id"] == "c"
+        assert not any(message.get("tool_call_id") in {"a", "b"} for message in messages)
+        return _completion("done")
+
+    monkeypatch.setattr(agent, "OpenAI", lambda **kwargs: OpenAI(
+        **kwargs, http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    ))
+    if interactive:
+        assert session_store.auto_save([
+            {"role": "system", "content": "previous system"},
+            {"role": "user", "content": "previous task"},
+            {"role": "assistant", "tool_calls": [tool_call("old", "read_file", file_path="old")]},
+            {"role": "tool", "tool_call_id": "old", "content": long_output + long_output},
+        ])
+        answers = iter(["y", prompt, "/exit"])
+        monkeypatch.setattr(agent.Prompt, "ask", lambda *args, **kwargs: next(answers))
+        assert agent.main([]) == 0
+        history = session_store.load_session("__auto__")
+        results = {
+            message["tool_call_id"]: message["content"]
+            for message in history if message["role"] == "tool"
+        }
+        assert results["old"] == long_output + long_output
+        assert results["a"] == results["b"] == long_output
+    else:
+        assert agent.main(["-p", prompt, "--json"]) == 0
+        events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        notices = [event for event in events if event.get("reason") == "context_compacted"]
+        assert len(notices) == 2
+        assert all(event["estimated_after"] <= event["message_budget"] for event in notices)
+        assert next(event for event in events if event.get("tool_call_id") == "a"
+                    and event["type"] == "tool_result")["result"] == long_output
+    assert len(requests) == 3
+
+
+@pytest.mark.parametrize("include_tools", [False, True])
+def test_budget_exhaustion_stops_before_provider_call(monkeypatch, include_tools):
+    monkeypatch.setattr(context_budget, "_encoding", lambda: None)
+
+    def unexpected_request(request):
+        pytest.fail("超出预算时发起了请求")
+
+    client = OpenAI(
+        api_key="test", base_url="https://provider.test/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(unexpected_request)),
+    )
+    tool_schema = tools.TOOLS if include_tools else []
+    model = ChatModel(client, "fake", 0, 1, False, 1, 0, tool_schema, context_limit=400)
+    prompt = "short" if include_tools else "x" * 1000
+    events = []
+    assert run_turn(
+        [], prompt, request_model=model, dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=1,
+    ) == "error"
+    assert events[-1]["reason"] == "context_budget_exceeded"
+    assert all(event["type"] not in {"tool_request", "reply"} for event in events)

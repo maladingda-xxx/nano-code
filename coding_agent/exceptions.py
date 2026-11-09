@@ -36,15 +36,25 @@ class ToolTimeoutError(ToolError):
 
 class AgentAPIError(Exception):
     """API 调用层异常（网络错误、重试耗尽等）。"""
-    pass
+    reason = "api_error"
+    allow_fallback = True
 
 
 class ModelResponseError(AgentAPIError):
     """The provider replied, but its response cannot complete a model round."""
 
+    allow_fallback = False
+
     def __init__(self, message: str, *, reason: str):
         super().__init__(message)
         self.reason = reason
+
+
+class ContextBudgetError(AgentAPIError):
+    """The essential messages and request overhead exceed the configured budget."""
+
+    reason = "context_budget_exceeded"
+    allow_fallback = False
 
 
 class TurnPersistenceError(Exception):

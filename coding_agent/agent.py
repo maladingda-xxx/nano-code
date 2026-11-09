@@ -13,12 +13,6 @@ from math import isfinite
 from pathlib import Path
 from uuid import uuid4
 
-try:
-    import tiktoken
-    _TIKTOKEN_AVAILABLE = True
-except ImportError:
-    _TIKTOKEN_AVAILABLE = False
-
 from dotenv import load_dotenv
 from openai import OpenAI
 from rich.console import Console
@@ -29,8 +23,9 @@ from rich.text import Text
 
 from agent_core import EventHandler, ToolResult, run_turn
 from changes import undo_last_edit
+from context_budget import estimate_tokens
 from exceptions import (
-    AgentAPIError, ToolError, ToolInputError, ToolSecurityError, ToolTimeoutError, TurnPersistenceError,
+    ToolError, ToolInputError, ToolSecurityError, ToolTimeoutError, TurnPersistenceError,
 )
 from execution_store import pending_executions, record_execution, recover_execution
 from model_api import ChatModel
@@ -351,159 +346,6 @@ def build_system_prompt(root: Path, directory: Path) -> str:
     return prompt
 
 
-# ============================================================
-# 5. Token 估算
-# ============================================================
-
-def estimate_tokens(messages: list[dict]) -> int:
-    """
-    估算消息列表的总 token 数。
-
-    优先使用 tiktoken（cl100k_base 编码器，GPT-4 / DeepSeek 通用），
-    如果 tiktoken 未安装则使用字符数 / 2 的粗略估算。
-
-    估算结果用于判断是否需要压缩，不需要精确到个位。
-    """
-    if _TIKTOKEN_AVAILABLE:
-        try:
-            enc = tiktoken.get_encoding("cl100k_base")
-            total = 0
-            for msg in messages:
-                total += 4
-                for key, value in msg.items():
-                    if isinstance(value, str):
-                        total += len(enc.encode(value))
-                    elif isinstance(value, list):
-                        total += len(enc.encode(json.dumps(value, ensure_ascii=False)))
-                total += 2
-            total += 2
-            return total
-        except Exception:
-            pass  # fall through to fallback
-
-    # fallback: 粗略估算（中英文混合约 2 字符 / token）
-    total_chars = sum(len(str(m)) for m in messages)
-    return total_chars // 2
-
-
-# ============================================================
-# 6. 智能上下文压缩 —— 三级策略
-# ============================================================
-
-def _summarize_with_llm(model: ChatModel, emit: EventHandler, history: list[dict]) -> str:
-    summary_messages = history + [{
-        "role": "user",
-        "content": "简要总结以下几项：用户目标、已完成的操作、关键文件、未解决的问题。",
-    }]
-    return model.summarize(summary_messages, emit)
-
-
-def compress_messages(
-    messages: list[dict], limit: int, model: ChatModel, emit: EventHandler,
-) -> list[dict]:
-    """
-    智能上下文压缩 —— 三级策略：
-
-    1. 轻量（token < 70% 上限）：不压缩，原样返回
-    2. 中度（70%-90%）：保留 system + 最近 4 轮完整 + 更早轮次截断 assistant
-    3. 重度（> 90%）：保留 system + 最近 2 轮 + 其余由模型摘要
-
-    参数:
-        messages: 当前完整消息列表
-
-    返回:
-        压缩后的消息列表（可能是原样）
-    """
-    if not messages:
-        return messages
-
-    current_tokens = estimate_tokens(messages)
-
-    # --- 轻量压缩：不触发 ---
-    light_threshold = int(limit * 0.70)
-    if current_tokens < light_threshold:
-        return messages
-
-    # 分离 system 消息
-    system_msgs = [m for m in messages if m["role"] == "system"]
-    other_msgs = [m for m in messages if m["role"] != "system"]
-
-    # 找到 user 消息的索引位置
-    user_indices = [i for i, m in enumerate(other_msgs) if m["role"] == "user"]
-
-    medium_threshold = int(limit * 0.90)
-
-    # --- 中度压缩：保留最近 4 轮，截断更早的 assistant 消息 ---
-    if current_tokens < medium_threshold:
-        keep_rounds = 4
-        if len(user_indices) <= keep_rounds:
-            return messages
-
-        cut_idx = user_indices[-(keep_rounds)]
-        recent_msgs = other_msgs[cut_idx:]
-        older_msgs = other_msgs[:cut_idx]
-
-        truncated = []
-        for msg in older_msgs:
-            if msg["role"] == "user":
-                truncated.append(msg)
-            elif msg["role"] == "assistant":
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 500:
-                    new_msg = msg.copy()
-                    new_msg["content"] = content[:200] + "\n...(已截断)"
-                    truncated.append(new_msg)
-                else:
-                    truncated.append(msg)
-            elif msg["role"] == "tool":
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 200:
-                    new_msg = msg.copy()
-                    new_msg["content"] = content[:200] + "\n...(已截断)"
-                    truncated.append(new_msg)
-                else:
-                    truncated.append(msg)
-
-        summary_hint = {
-            "role": "system",
-            "content": "[以下是更早的对话摘要，部分 assistant 回复已被截断]",
-        }
-
-        compressed = system_msgs + [summary_hint] + truncated + recent_msgs
-
-        emit({"type": "notice", "text": f"中度压缩：约 {current_tokens} → {estimate_tokens(compressed)} tokens。"})
-        return compressed
-
-    # --- 重度压缩：保留最近 2 轮，其余由模型摘要 ---
-    keep_rounds = 2
-    cut_idx = user_indices[-(keep_rounds)] if len(user_indices) >= keep_rounds else 0
-    recent_msgs = other_msgs[cut_idx:]
-    older_msgs = other_msgs[:cut_idx]
-
-    if older_msgs:
-        emit({"type": "notice", "text": "正在生成历史摘要。"})
-        try:
-            summary = _summarize_with_llm(model, emit, older_msgs)
-        except AgentAPIError:
-            return messages
-        if not summary:
-            return messages
-        summary_msg = {
-            "role": "system",
-            "content": f"[历史摘要] {summary}",
-        }
-    else:
-        summary_msg = None
-
-    compressed = system_msgs[:]
-    if summary_msg:
-        compressed.append(summary_msg)
-    compressed.extend(recent_msgs)
-
-    emit({"type": "notice", "text": f"重度压缩：约 {current_tokens} → {estimate_tokens(compressed)} tokens。"})
-    return compressed
-
-
 def execute_tool_call(
     call: dict, emit: EventHandler | None = None, *,
     confirm=None, interactive: bool = False, command_timeout: float = 60,
@@ -756,9 +598,6 @@ def _run_interactive(
                 dispatch_with_events=_interactive_dispatch(command_timeout),
                 emit=emit, max_tool_rounds=max_rounds, save=auto_save,
                 session_id=session_id, checkpoint=record_execution,
-                prepare_with_events=lambda history, publish: compress_messages(
-                    history, context_limit, model, publish,
-                ),
             )
 
 
@@ -812,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
             temperature=float(os.getenv("TEMPERATURE", "0.7")),
             top_p=float(os.getenv("TOP_P", "1.0")),
             streaming=os.getenv("STREAMING_ENABLED", "true").lower() in ("true", "1", "yes"),
-            max_attempts=attempts, retry_delay=retry_delay, tools=TOOLS,
+            max_attempts=attempts, retry_delay=retry_delay, tools=TOOLS, context_limit=context_limit,
         )
     except ValueError as error:
         error_console.print(Text(f"配置错误：{error}", "red"))

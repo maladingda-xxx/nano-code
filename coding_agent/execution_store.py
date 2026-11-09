@@ -178,6 +178,21 @@ def pending_executions() -> list[dict]:
         raise TurnPersistenceError(f"无法读取执行记录：{error}") from error
 
 
+def execution_session(turn_id: str) -> str | None:
+    """Return the stable session id recorded for a turn."""
+    path = _get_db_path()
+    if not Path(path).is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(path)) as conn:
+            row = conn.execute(
+                "SELECT session_id FROM execution_turns WHERE turn_id = ?", (turn_id,),
+            ).fetchone()
+            return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+
 def recover_execution(turn_id: str) -> list[dict] | None:
     path = _get_db_path()
     if not Path(path).is_file():
@@ -188,16 +203,17 @@ def recover_execution(turn_id: str) -> list[dict] | None:
             _ensure_execution_tables(conn)
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT owner_pid, history FROM execution_turns WHERE turn_id = ? AND status = 'running'",
+                """SELECT owner_pid, history, session_id FROM execution_turns
+                   WHERE turn_id = ? AND status = 'running'""",
                 (turn_id,),
             ).fetchone()
             if row is None:
                 return None
-            pid, history = row
+            pid, history, session_id = row
             if pid != os.getpid() and _process_running(pid):
                 raise TurnPersistenceError("该轮所属进程可能仍在运行，待其退出后再恢复。")
             messages, _ = _recovery_history(history, _tool_history(conn, turn_id))
-            _write_session(conn, "__auto__", messages)
+            _write_session(conn, "__auto__", messages, uid=session_id)
             conn.execute(
                 "UPDATE execution_turns SET status = 'recovered', history = NULL WHERE turn_id = ?",
                 (turn_id,),

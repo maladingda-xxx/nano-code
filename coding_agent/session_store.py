@@ -7,6 +7,7 @@ session_store.py —— 会话持久化（SQLite）
 特性：
   - 自动保存：每轮完成或中断后写入 SQLite
   - 启动恢复：检测到上次会话时可选择继续
+  - 稳定 UID：自动恢复、命名保存和加载沿用同一会话 ID
   - 命名保存：支持 /save <名称> 手动命名保存
   - 加载会话：支持 /load <名称> 加载已命名会话
   - 列出会话：支持 /sessions 列出所有已保存会话
@@ -21,6 +22,7 @@ import sys
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 _workspace_root: Path | None = None
 
@@ -45,7 +47,7 @@ def _readable_db_paths():
 
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
-    """创建必需的表（如果不存在）。"""
+    """创建必需的表（如果不存在），并迁移旧存档缺少的会话 UID。"""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +57,14 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             message_count INTEGER DEFAULT 0
         )
     """)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "uid" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN uid TEXT")
+        for (session_id,) in conn.execute("SELECT id FROM sessions WHERE uid IS NULL").fetchall():
+            conn.execute(
+                "UPDATE sessions SET uid = ? WHERE id = ?", (uuid4().hex, session_id),
+            )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_uid ON sessions(uid)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,13 +86,14 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
 # 保存会话
 # ============================================================
 
-def save_session(name: str, messages: list[dict]) -> bool:
+def save_session(name: str, messages: list[dict], uid: str | None = None) -> bool:
     """
     将当前消息列表保存为一个命名的会话。
 
     参数:
         name:     会话名称
         messages: 消息列表
+        uid:      稳定会话 ID；同名会话已存在时保留其原 UID
 
     返回:
         是否保存成功
@@ -94,7 +105,7 @@ def save_session(name: str, messages: list[dict]) -> bool:
         _ensure_tables(conn)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("BEGIN IMMEDIATE")
-        _write_session(conn, name, messages)
+        _write_session(conn, name, messages, uid=uid)
         conn.commit()
         return True
     except (sqlite3.Error, TypeError, ValueError) as e:
@@ -105,26 +116,32 @@ def save_session(name: str, messages: list[dict]) -> bool:
             conn.close()
 
 
-def _write_session(conn: sqlite3.Connection, name: str, messages: list[dict]) -> None:
+def _write_session(
+    conn: sqlite3.Connection, name: str, messages: list[dict], uid: str | None = None,
+) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 检查是否存在同名会话
     existing = conn.execute(
-        "SELECT id FROM sessions WHERE name = ?", (name,)
+        "SELECT id, uid FROM sessions WHERE name = ?", (name,)
     ).fetchone()
 
     if existing:
-        session_id = existing[0]
+        session_id, existing_uid = existing
+        # The explicit UID wins so the __auto__ slot can follow /clear and /load.
+        uid = uid or existing_uid or uuid4().hex
         # 删除旧消息
         conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         conn.execute(
-            "UPDATE sessions SET updated_at = ?, message_count = ? WHERE id = ?",
-            (now, 0, session_id),
+            "UPDATE sessions SET uid = ?, updated_at = ?, message_count = ? WHERE id = ?",
+            (uid, now, 0, session_id),
         )
     else:
+        uid = uid or uuid4().hex
         cursor = conn.execute(
-            "INSERT INTO sessions (name, created_at, updated_at, message_count) VALUES (?, ?, ?, ?)",
-            (name, now, now, 0),
+            """INSERT INTO sessions (name, uid, created_at, updated_at, message_count)
+               VALUES (?, ?, ?, ?, ?)""",
+            (name, uid, now, now, 0),
         )
         session_id = cursor.lastrowid
 
@@ -160,18 +177,19 @@ def _write_session(conn: sqlite3.Connection, name: str, messages: list[dict]) ->
 # 自动保存（当前会话）
 # ============================================================
 
-def auto_save(messages: list[dict]) -> bool:
+def auto_save(messages: list[dict], uid: str | None = None) -> bool:
     """
     自动保存当前会话到默认槽位（名称固定为 '__auto__'）。
     在每轮完成或中断后自动调用。
 
     参数:
         messages: 当前消息列表
+        uid:      稳定会话 ID；同名会话已存在时保留其原 UID
 
     返回:
         是否保存成功
     """
-    return save_session("__auto__", messages)
+    return save_session("__auto__", messages, uid=uid)
 
 
 # ============================================================
@@ -188,27 +206,34 @@ def load_session(name: str) -> list[dict] | None:
     返回:
         消息列表，如果会话不存在则返回 None
     """
+    record = load_session_record(name)
+    return record["messages"] if record is not None else None
+
+
+def load_session_record(name: str) -> dict | None:
+    """Load messages together with the stable session UID."""
     for db_path in _readable_db_paths():
-        messages = _load_session_from(db_path, name)
-        if messages is not None:
-            return messages
+        record = _load_session_record_from(db_path, name)
+        if record is not None:
+            return record
     return None
 
 
-def _load_session_from(db_path: Path, name: str) -> list[dict] | None:
+def _load_session_record_from(db_path: Path, name: str) -> dict | None:
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         _ensure_tables(conn)
         session = conn.execute(
-            "SELECT id, message_count FROM sessions WHERE name = ? ORDER BY updated_at DESC LIMIT 1",
+            """SELECT id, uid, message_count FROM sessions
+               WHERE name = ? ORDER BY updated_at DESC LIMIT 1""",
             (name,),
         ).fetchone()
 
         if not session:
             return None
 
-        session_id, _ = session
+        session_id, uid, _ = session
         rows = conn.execute(
             "SELECT role, content, tool_calls, tool_call_id, name FROM messages WHERE session_id = ? ORDER BY seq",
             (session_id,),
@@ -228,7 +253,7 @@ def _load_session_from(db_path: Path, name: str) -> list[dict] | None:
                 msg["name"] = tool_name
             messages.append(msg)
 
-        return messages
+        return {"uid": uid or "", "messages": messages}
     except (sqlite3.Error, ValueError) as e:
         print(f"加载会话失败: {e}", file=sys.stderr)
         return None
@@ -249,13 +274,14 @@ def list_saved_sessions() -> list[dict]:
             with closing(sqlite3.connect(db_path)) as conn:
                 _ensure_tables(conn)
                 rows = conn.execute(
-                    "SELECT name, created_at, updated_at, message_count FROM sessions"
+                    "SELECT name, uid, created_at, updated_at, message_count FROM sessions"
                 ).fetchall()
         except sqlite3.Error:
             continue
-        for name, created, updated, count in rows:
+        for name, uid, created, updated, count in rows:
             sessions.setdefault(name, {
-                "name": name, "created_at": created, "updated_at": updated, "message_count": count,
+                "name": name, "uid": uid or "", "created_at": created,
+                "updated_at": updated, "message_count": count,
             })
     return sorted(sessions.values(), key=lambda session: session["updated_at"], reverse=True)
 

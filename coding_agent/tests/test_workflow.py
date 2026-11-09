@@ -277,6 +277,78 @@ def test_edit_after_verification_requires_a_new_check(workspace):
     assert events[-1]["verification"] == {"status": "stale", "tool_call_id": "verify", "round": 1}
 
 
+def test_session_uid_is_stable_across_save_and_load(workspace):
+    messages = [{"role": "user", "content": "hello"}]
+    assert session_store.save_session("named", messages, uid="uid-1")
+    record = session_store.load_session_record("named")
+    assert record == {"uid": "uid-1", "messages": messages}
+
+    assert session_store.save_session("named", [{"role": "user", "content": "next"}])
+    assert session_store.load_session_record("named")["uid"] == "uid-1"
+
+    assert session_store.auto_save(messages, uid="auto-uid")
+    assert session_store.load_session_record("__auto__")["uid"] == "auto-uid"
+    assert session_store.auto_save(messages, uid="next-uid")
+    assert session_store.load_session_record("__auto__")["uid"] == "next-uid"
+    listed = {session["name"]: session for session in session_store.list_saved_sessions()}
+    assert listed["named"]["uid"] == "uid-1"
+    assert listed["__auto__"]["uid"] == "next-uid"
+
+
+def test_legacy_session_table_gets_uid(workspace):
+    db = workspace / ".coding_agent_sessions.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """CREATE TABLE sessions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+               created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+               message_count INTEGER DEFAULT 0)"""
+        )
+        conn.execute(
+            """INSERT INTO sessions (name, created_at, updated_at, message_count)
+               VALUES ('old', '2026-01-01', '2026-01-01', 0)"""
+        )
+
+    sessions = session_store.list_saved_sessions()
+    assert sessions[0]["name"] == "old"
+    assert sessions[0]["uid"]
+    with sqlite3.connect(db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    assert "uid" in columns
+
+
+def test_undo_is_scoped_to_the_current_session(workspace):
+    first = workspace / "first.txt"
+    second = workspace / "second.txt"
+    first.write_text("first-before")
+    second.write_text("second-before")
+    _run_edit_turn(iter([
+        tool_call("a", "edit_file", file_path="first.txt",
+                  old_text="first-before", new_text="first-after"),
+    ]), session_id="session-a")
+    _run_edit_turn(iter([
+        tool_call("b", "edit_file", file_path="second.txt",
+                  old_text="second-before", new_text="second-after"),
+    ]), session_id="session-b")
+
+    assert "已撤销" in undo_last_edit(workspace, "session-a")
+    assert first.read_text() == "first-before"
+    assert second.read_text() == "second-after"
+    assert "当前会话没有可撤销" in undo_last_edit(workspace, "session-a")
+    assert "已撤销" in undo_last_edit(workspace, "session-b")
+    assert second.read_text() == "second-before"
+
+
+def test_undo_falls_back_to_legacy_unattributed_edit(workspace):
+    path = workspace / "legacy.txt"
+    path.write_text("before")
+    tools.edit_file("legacy.txt", "before", "after")
+
+    result = undo_last_edit(workspace, "new-session")
+    assert "旧版未关联会话" in result
+    assert path.read_text() == "before"
+
+
 def test_session_load_can_read_legacy_subdirectory_save(workspace, monkeypatch):
     directory = workspace / "sub"
     directory.mkdir()
@@ -513,7 +585,9 @@ run_turn([], "work", request_model=lambda *_: ModelReply(tool_calls=calls),
         assert "结果待核查" in output
     if "not_started" in expected:
         assert "未开始" in output
-    history = session_store.load_session("__auto__")
+    record = session_store.load_session_record("__auto__")
+    history = record["messages"]
+    assert record["uid"] == pending["session_id"]
     results = [message for message in history if message["role"] == "tool"]
     assert [result["tool_call_id"] for result in results] == ["read", "write", "command"]
     for result, state in zip(results, expected):

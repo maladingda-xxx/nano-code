@@ -66,10 +66,11 @@ def usage_summary(output):
 class AgentProcess:
     """Run the interactive CLI with piped input and a prompt responder."""
 
-    def __init__(self, destination):
+    def __init__(self, destination, restore_answer="n"):
         self.lines = []
         self.condition = threading.Condition()
         self.write_lock = threading.Lock()
+        self.restore_answer = restore_answer
         self.proc = subprocess.Popen(
             [sys.executable, "-B", str(AGENT), "--env-file", str(ENV_FILE)],
             cwd=destination, env=agent_env(), stdin=subprocess.PIPE,
@@ -85,8 +86,8 @@ class AgentProcess:
                 with self.condition:
                     self.lines.append(line)
                     self.condition.notify_all()
-                if "恢复上次会话？" in line:
-                    self.send("n")
+                if "恢复上次会话？" in line and self.restore_answer is not None:
+                    self.send(self.restore_answer)
                 elif "执行此命令？" in line:
                     self.send("n")
         except (OSError, ValueError):

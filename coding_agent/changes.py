@@ -102,26 +102,43 @@ def record_edit(
         raise ToolExecutionError(f"无法保存文件修改: {error}", tool_name=tool) from error
 
 
-def undo_last_edit(root: Path) -> str:
+def undo_last_edit(root: Path, session_id: str | None = None) -> str:
     if not Path(_get_db_path()).is_file():
         return "没有可撤销的文件修改。"
     try:
         with closing(sqlite3.connect(_get_db_path())) as conn, conn:
             _ensure_journal(conn)
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT id, path, before, after_hash FROM file_edits ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+            legacy = False
+            if session_id is None:
+                row = conn.execute(
+                    "SELECT id, path, before, after_hash FROM file_edits ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT id, path, before, after_hash FROM file_edits
+                       WHERE session_id = ? ORDER BY id DESC LIMIT 1""",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        """SELECT id, path, before, after_hash FROM file_edits
+                           WHERE session_id IS NULL ORDER BY id DESC LIMIT 1"""
+                    ).fetchone()
+                    legacy = row is not None
             if row is None:
-                return "没有可撤销的文件修改。"
+                if session_id is None:
+                    return "没有可撤销的文件修改。"
+                return "当前会话没有可撤销的文件修改。"
             edit_id, name, before, after_hash = row
             path = workspace_path(root, name, "undo")
             current = read_bytes(path)
+            label = "旧版未关联会话的" if legacy else ""
             if current == before:
                 result = f"{name} 已是修改前的内容。"
             elif current is not None and hashlib.sha256(current).digest() == after_hash:
                 _replace(path, current, before)
-                result = f"已撤销对 {name} 的最后一次文件修改。"
+                result = f"已撤销{label}对 {name} 的最后一次文件修改。"
             else:
                 return f"{name} 在修改后发生了变化，已保留当前内容。"
             conn.execute("DELETE FROM file_edits WHERE id = ?", (edit_id,))

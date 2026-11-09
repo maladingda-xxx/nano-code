@@ -30,9 +30,13 @@ from context_budget import estimate_tokens
 from exceptions import (
     ToolError, ToolInputError, ToolSecurityError, ToolTimeoutError, TurnPersistenceError,
 )
-from execution_store import pending_executions, record_execution, recover_execution
+from execution_store import (
+    execution_session, pending_executions, record_execution, recover_execution,
+)
 from model_api import ChatModel
-from session_store import auto_save, list_saved_sessions, load_session, save_session
+from session_store import (
+    auto_save, list_saved_sessions, load_session_record, save_session,
+)
 from tools import AVAILABLE_TOOLS, TOOLS, run_command, set_workspace_root
 from workspace import find_root, read_project_instructions
 
@@ -144,6 +148,7 @@ def print_sessions() -> None:
 
     table = Table(title="已保存的会话", border_style="cyan")
     table.add_column("名称", style="bold cyan")
+    table.add_column("会话 ID")
     table.add_column("消息数", justify="right")
     table.add_column("创建时间")
     table.add_column("更新时间")
@@ -151,6 +156,7 @@ def print_sessions() -> None:
     for s in sessions:
         table.add_row(
             s["name"].replace("__auto__", "(自动保存)"),
+            (s.get("uid") or "")[:8],
             str(s["message_count"]),
             s["created_at"],
             s["updated_at"],
@@ -629,12 +635,18 @@ def _run_interactive(
     print_banner(model, root, max_rounds, context_limit)
     system = messages[0]
     _report_pending_executions(_terminal_events(), show_arguments=True)
-    saved = load_session("__auto__")
-    if saved and Prompt.ask("恢复上次会话？", choices=["y", "n"], default="y") == "y":
-        messages.extend(saved[1:] if saved[0]["role"] == "system" else saved)
+    saved = load_session_record("__auto__")
+    session_uid = uuid4().hex
+    if saved and saved["messages"] and Prompt.ask(
+        "恢复上次会话？", choices=["y", "n"], default="y",
+    ) == "y":
+        saved_messages = saved["messages"]
+        messages.extend(
+            saved_messages[1:] if saved_messages[0]["role"] == "system" else saved_messages
+        )
+        session_uid = saved["uid"] or uuid4().hex
 
     session_start = time.time()
-    session_id = uuid4().hex
     while True:
         try:
             user_input = Prompt.ask("\n[bold green]▸[/bold green] 你").strip()
@@ -645,13 +657,13 @@ def _run_interactive(
         command, _, name = user_input.partition(" ")
         command = command.lower()
         if command == "/exit":
-            auto_save(messages)
+            auto_save(messages, session_uid)
             print_goodbye()
             return 0
         if command == "/clear":
             messages[:] = [system]
-            session_id = uuid4().hex
-            auto_save(messages)
+            session_uid = uuid4().hex
+            auto_save(messages, session_uid)
             console.print("上下文已清空。")
         elif command == "/help":
             print_help()
@@ -674,11 +686,11 @@ def _run_interactive(
                 console.print("找不到待恢复的轮次。")
                 continue
             messages[:] = [system, *(recovered[1:] if recovered[0]["role"] == "system" else recovered)]
-            session_id = uuid4().hex
+            session_uid = execution_session(turn_id) or uuid4().hex
             console.print("已恢复对话。请先核查结果不确定的操作，再输入下一条指令。")
         elif command == "/undo":
             try:
-                console.print(Text(undo_last_edit(root)))
+                console.print(Text(undo_last_edit(root, session_uid)))
             except ToolError as error:
                 console.print(Text(str(error), "red"))
         elif command == "/checkpoints":
@@ -689,15 +701,19 @@ def _run_interactive(
             name = name.strip()
             if not name or name == "__auto__":
                 console.print("用法：/save <会话名称>")
-            elif save_session(name, messages):
+            elif save_session(name, messages, uid=session_uid):
                 console.print(Text(f"已保存会话 {name}。"))
         elif command == "/load":
             name = name.strip()
-            loaded = load_session(name)
-            if loaded:
-                messages[:] = [system, *(loaded[1:] if loaded[0]["role"] == "system" else loaded)]
-                session_id = uuid4().hex
-                auto_save(messages)
+            loaded = load_session_record(name)
+            if loaded and loaded["messages"]:
+                loaded_messages = loaded["messages"]
+                messages[:] = [
+                    system,
+                    *(loaded_messages[1:] if loaded_messages[0]["role"] == "system" else loaded_messages),
+                ]
+                session_uid = loaded["uid"] or uuid4().hex
+                auto_save(messages, session_uid)
                 console.print(Text(f"已加载会话 {name}。"))
             else:
                 console.print(Text(f"找不到会话 {name}。"))
@@ -706,8 +722,9 @@ def _run_interactive(
             run_turn(
                 messages, user_input, request_model=model,
                 dispatch_with_events=_interactive_dispatch(command_timeout),
-                emit=emit, max_tool_rounds=max_rounds, save=auto_save,
-                session_id=session_id, checkpoint=record_execution,
+                emit=emit, max_tool_rounds=max_rounds,
+                save=lambda saved_messages: auto_save(saved_messages, uid=session_uid),
+                session_id=session_uid, checkpoint=record_execution,
             )
 
 
@@ -800,11 +817,12 @@ def main(argv: list[str] | None = None) -> int:
         return cwd == root and tuple(command) in allowed
 
     _report_pending_executions(emit)
+    session_uid = uuid4().hex
     status = run_turn(
         messages, args.prompt, request_model=model,
         dispatch_with_events=partial(execute_tool_call, confirm=confirm, command_timeout=command_timeout),
         emit=emit, max_tool_rounds=max_rounds,
-        checkpoint=record_execution,
+        session_id=session_uid, checkpoint=record_execution,
     )
     return {"completed": 0, "error": 1, "interrupted": 130}[status]
 

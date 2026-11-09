@@ -87,6 +87,7 @@
       "repository": "nano-code",
       "type": "feature",
       "prompt": "为 search_workspace 增加可选 case_sensitive 参数，默认 true。为 false 时按 Unicode casefold 匹配，保留原始匹配文本和行号。同步工具参数定义与使用文档，运行指定验收测试。",
+      "allowed_paths": ["coding_agent/tools.py", "coding_agent/README.md"],
       "fixture": "search_case.py",
       "verify": ["nano_eval_test.py"]
     },
@@ -95,6 +96,7 @@
       "repository": "itsdangerous",
       "type": "feature",
       "prompt": "新增公开函数 base64_encoded_size(size)，根据非负字节数计算无填充 URL 安全 Base64 输出长度，无需创建字节串。负数抛出 ValueError，从包根导出并保留现有编码行为。运行指定验收测试。",
+      "allowed_paths": ["src/itsdangerous/encoding.py", "src/itsdangerous/__init__.py"],
       "fixture": "base64_size.py",
       "verify": ["nano_eval_test.py", "tests/test_itsdangerous/test_encoding.py"]
     },

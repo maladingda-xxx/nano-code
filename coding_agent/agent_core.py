@@ -71,12 +71,20 @@ def run_turn(
             messages[:] = prepare(messages)
         for round_number in range(max_tool_rounds + 1):
             allow_tools = round_number < max_tool_rounds
+            request_messages = messages
             if not allow_tools:
                 reason = "tool_round_limit"
                 publish({"type": "notice", "text": "已达到工具调用上限，正在总结已有结果。"})
+                # Tools are omitted from the final request, so tell the model to stop
+                # emitting tool calls instead of relying on the user-visible notice.
+                request_messages = [*messages, {
+                    "role": "user",
+                    "content": "工具调用轮数已用完。请不要再请求工具，基于已有工具结果直接给出最终答复。",
+                    "_runtime_notice": True,
+                }]
             publish({"type": "model_start", "round": round_number + 1})
             try:
-                reply = request_model(messages, allow_tools, publish)
+                reply = request_model(request_messages, allow_tools, publish)
             except AgentAPIError as error:
                 if not allow_tools or not error.allow_fallback:
                     raise

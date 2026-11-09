@@ -17,7 +17,9 @@ import session_store
 import tools
 from agent_core import ModelReply, run_turn
 from changes import undo_last_edit
-from exceptions import AgentAPIError, ToolInputError, ToolSecurityError, TurnPersistenceError
+from exceptions import (
+    AgentAPIError, ModelResponseError, ToolInputError, ToolSecurityError, TurnPersistenceError,
+)
 from execution_store import _process_running, pending_executions, record_execution, recover_execution
 from model_api import ChatModel
 from workspace import find_root, read_project_instructions
@@ -780,3 +782,65 @@ def test_model_request_limit_counts_retries_and_blocks_fallback(monkeypatch):
     assert all(body.get("tools") and "thinking" not in body for body in requests)
     assert [event["number"] for event in events if event["type"] == "model_request"] == [1, 2]
     assert events[-1]["reason"] == "model_request_budget_exceeded"
+
+
+def test_final_round_tells_model_to_stop_calling_tools(workspace):
+    (workspace / "note.txt").write_text("hello")
+    calls = iter([tool_call("read", "read_file", file_path="note.txt")])
+    seen = []
+
+    def request(messages, allow_tools, emit):
+        seen.append((allow_tools, messages[-1]))
+        call = next(calls, None)
+        if call:
+            assert allow_tools
+            return ModelReply(tool_calls=[call])
+        assert not allow_tools
+        return ModelReply("done")
+
+    messages = [{"role": "system", "content": "system"}]
+    assert run_turn(
+        messages, "look", request_model=request, dispatch=agent.execute_tool_call,
+        emit=lambda event: None, max_tool_rounds=1,
+    ) == "completed"
+    assert [allow_tools for allow_tools, _ in seen] == [True, False]
+    reminder = seen[-1][1]
+    assert reminder["role"] == "user"
+    assert "工具调用轮数已用完" in reminder["content"]
+    assert messages[-1]["content"] == "done"
+    assert all("工具调用轮数已用完" not in (message.get("content") or "") for message in messages)
+
+
+def test_tool_markup_without_tools_is_rejected():
+    with pytest.raises(ModelResponseError) as error:
+        model_api._checked_reply(
+            "<｜｜DSML｜｜ calls>", [], "stop", allow_tools=False,
+        )
+    assert error.value.reason == "tool_markup_without_tools"
+
+
+def test_runtime_notice_keeps_current_tool_batch_when_compacting(monkeypatch):
+    monkeypatch.setattr(context_budget, "_encoding", lambda: None)
+    tool_calls = [{
+        "id": "1", "type": "function",
+        "function": {"name": "read_file", "arguments": "{}"},
+    }]
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old task"},
+        {"role": "assistant", "content": "OLD" * 1000},
+        {"role": "user", "content": "current task"},
+        {"role": "assistant", "content": None, "tool_calls": tool_calls},
+        {"role": "tool", "tool_call_id": "1", "content": "TOOL RESULT"},
+        {"role": "user", "content": "REMINDER", "_runtime_notice": True},
+    ]
+    limit = context_budget.estimate_tokens(messages[3:]) + 100
+    events = []
+    fitted, _ = context_budget.fit_request(
+        messages, [], limit=limit, max_output=50, emit=events.append,
+    )
+    assert any(message.get("content") == "TOOL RESULT" for message in fitted)
+    assert any(message.get("content") == "REMINDER" for message in fitted)
+    assert all("_runtime_notice" not in message for message in fitted)
+    assert not any(message.get("content") == "OLD" * 1000 for message in fitted)
+    assert events[-1]["reason"] == "context_compacted"

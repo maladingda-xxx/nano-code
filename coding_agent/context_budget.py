@@ -39,10 +39,21 @@ def _split_turns(messages: list[dict]) -> tuple[list[dict], list[list[dict]]]:
         if role in {"system", "developer"}:
             instructions.append(message)
         else:
+            if message.get("_runtime_notice") and turns:
+                turns[-1].append(message)
+                continue
             if not turns or role == "user":
                 turns.append([])
             turns[-1].append(message)
     return instructions, turns
+
+
+def _public(messages: list[dict]) -> list[dict]:
+    """Strip internal request markers before sending messages to a provider."""
+    return [
+        {key: value for key, value in message.items() if not key.startswith("_")}
+        for message in messages
+    ]
 
 
 def _tool_batches(messages: list[dict]) -> list[list[dict]]:
@@ -100,7 +111,7 @@ def fit_request(
     budget = limit - output - overhead
     before = estimate_tokens(messages)
     if before <= budget:
-        return messages, output
+        return _public(messages), output
 
     instructions, turns = _split_turns(messages)
     current = turns[-1] if turns else []
@@ -127,4 +138,4 @@ def fit_request(
         "reserved_output": output, "dropped_messages": len(messages) - len(fitted),
         "text": f"已压缩本次请求上下文（约 {before} → {after} tokens）。",
     })
-    return fitted, output
+    return _public(fitted), output

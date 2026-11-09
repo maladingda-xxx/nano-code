@@ -10,6 +10,8 @@ from agent_core import EventHandler, ModelReply
 from context_budget import fit_request
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 
+TOOL_MARKUP_MARKERS = ("<｜｜DSML｜｜", "<|tool_call|>", "<tool_calls>")
+
 
 def _checked_reply(
     text: str | None, calls: list[dict], finish_reason: str | None, *, allow_tools: bool,
@@ -26,6 +28,13 @@ def _checked_reply(
         )
     if (finish_reason == "tool_calls" and not calls) or (calls and not allow_tools):
         raise ModelResponseError("模型返回了异常的工具调用。", reason="invalid_tool_calls")
+    if (
+        not allow_tools and not calls and text
+        and any(marker in text for marker in TOOL_MARKUP_MARKERS)
+    ):
+        raise ModelResponseError(
+            "模型在未启用工具时输出了工具调用标记。", reason="tool_markup_without_tools",
+        )
 
     ids = set()
     for call in calls:

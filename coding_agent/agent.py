@@ -23,7 +23,9 @@ from rich.table import Table
 from rich.text import Text
 
 from agent_core import EventHandler, ToolResult, run_turn
-from changes import undo_last_edit
+from changes import (
+    list_checkpoints, preview_checkpoint, resolve_turn_id, restore_checkpoint, undo_last_edit,
+)
 from context_budget import estimate_tokens
 from exceptions import (
     ToolError, ToolInputError, ToolSecurityError, ToolTimeoutError, TurnPersistenceError,
@@ -88,6 +90,9 @@ def print_help():
   /sessions  列出所有已保存的会话
   /undo      撤销最近一次内置文件修改
   /recover   查看未结束的轮次，或用 /recover <轮次 ID> 恢复
+  /checkpoints           列出最近的会话检查点
+  /checkpoints <轮次 ID> 预览某次检查点的文件状态
+  /restore <轮次 ID>     预览并恢复指定检查点
 
 [bold]可用工具（由模型自动调用）:[/bold]
 
@@ -512,6 +517,97 @@ def _report_pending_executions(emit: EventHandler, *, show_arguments: bool = Fal
     return bool(pending)
 
 
+def _print_checkpoints() -> None:
+    try:
+        checkpoints = list_checkpoints()
+    except ToolError as error:
+        console.print(Text(str(error), "red"))
+        return
+    if not checkpoints:
+        console.print("没有可用的文件检查点。")
+        return
+    for checkpoint in checkpoints:
+        turn = checkpoint["turn_id"][:8] if checkpoint["turn_id"] else "未关联轮次"
+        session = f" · 会话 {checkpoint['session_id'][:8]}" if checkpoint["session_id"] else ""
+        created = checkpoint["created_at"] or "时间未知"
+        paths = "、".join(checkpoint["paths"][:3])
+        if len(checkpoint["paths"]) > 3:
+            paths += "…"
+        console.print(Text(f"{turn}{session} · {created} · {checkpoint['files']} 个文件 · {paths}", "dim"))
+
+
+def _print_checkpoint_preview(turn_id: str, entries: list[dict]) -> None:
+    console.print(Text(f"检查点 {turn_id}", "bold"))
+    if not entries:
+        console.print("该轮次没有文件修改。")
+        return
+    labels = {
+        "restorable": ("可恢复", "green"),
+        "already_restored": ("已是修改前", "dim"),
+        "conflict": ("冲突", "yellow"),
+        "missing": ("文件不存在", "red"),
+    }
+    for entry in entries:
+        label, style = labels.get(entry["status"], (entry["status"], ""))
+        console.print(Text(f"  {label} · {entry['path']} · {entry['detail']}", style))
+
+
+def _print_restore_result(result: dict) -> None:
+    if result["restored"]:
+        console.print(Text(
+            f"已恢复 {len(result['restored'])} 个文件：{'、'.join(result['restored'])}", "green",
+        ))
+    if result["already"]:
+        console.print(Text(f"{len(result['already'])} 个文件已是修改前内容。", "dim"))
+    for item in result["conflicts"]:
+        console.print(Text(f"冲突 · {item['path']} · {item['detail']}", "yellow"))
+    for item in result["failed"]:
+        console.print(Text(f"失败 · {item['path']} · {item['detail']}", "red"))
+    if not any(result[key] for key in ("restored", "already", "conflicts", "failed")):
+        console.print("没有需要恢复的文件。")
+
+
+def _checkpoint_command(root: Path, name: str) -> None:
+    if not name.strip():
+        _print_checkpoints()
+        return
+    try:
+        turn_id = resolve_turn_id(name.strip())
+        entries = preview_checkpoint(root, turn_id)
+    except ToolError as error:
+        console.print(Text(str(error), "red"))
+        return
+    _print_checkpoint_preview(turn_id, entries)
+
+
+def _restore_command(root: Path, name: str) -> None:
+    if not name.strip():
+        console.print("用法：/restore <轮次 ID>")
+        return
+    try:
+        turn_id = resolve_turn_id(name.strip())
+        entries = preview_checkpoint(root, turn_id)
+    except ToolError as error:
+        console.print(Text(str(error), "red"))
+        return
+    _print_checkpoint_preview(turn_id, entries)
+    restorable = [entry for entry in entries if entry["status"] == "restorable"]
+    if not restorable:
+        console.print("没有可恢复的文件。")
+        return
+    answer = Prompt.ask(
+        f"恢复 {len(restorable)} 个文件？", choices=["y", "n"], default="n",
+    )
+    if answer != "y":
+        return
+    try:
+        result = restore_checkpoint(root, turn_id)
+    except ToolError as error:
+        console.print(Text(str(error), "red"))
+        return
+    _print_restore_result(result)
+
+
 def _interactive_dispatch(command_timeout: float):
     approvals = {}
 
@@ -585,6 +681,10 @@ def _run_interactive(
                 console.print(Text(undo_last_edit(root)))
             except ToolError as error:
                 console.print(Text(str(error), "red"))
+        elif command == "/checkpoints":
+            _checkpoint_command(root, name)
+        elif command == "/restore":
+            _restore_command(root, name)
         elif command == "/save":
             name = name.strip()
             if not name or name == "__auto__":

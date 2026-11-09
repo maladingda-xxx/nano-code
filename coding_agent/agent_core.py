@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from time import perf_counter
 from uuid import uuid4
 
+from edit_context import edit_scope
 from exceptions import AgentAPIError, ModelResponseError, TurnPersistenceError
 
 EventHandler = Callable[[dict], None]
@@ -132,13 +133,14 @@ def run_turn(
                 tool_scope = {"call": call, "tool_call_id": call["id"], "round": round_number + 1}
                 publish({"type": "tool_request", **tool_scope}, durable=True)
                 started = perf_counter()
-                if dispatch_with_events is not None:
-                    def publish_tool(event: dict) -> None:
-                        publish({**event, "tool_call_id": call["id"], "round": round_number + 1})
+                with edit_scope(scope["session_id"], scope["turn_id"], call["id"]):
+                    if dispatch_with_events is not None:
+                        def publish_tool(event: dict) -> None:
+                            publish({**event, "tool_call_id": call["id"], "round": round_number + 1})
 
-                    result = dispatch_with_events(call, publish_tool)
-                else:
-                    result = dispatch(call)
+                        result = dispatch_with_events(call, publish_tool)
+                    else:
+                        result = dispatch(call)
                 elapsed_ms = round((perf_counter() - started) * 1000)
                 if isinstance(result, str):
                     result = ToolResult(result)

@@ -1,5 +1,7 @@
+import hashlib
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -16,7 +18,9 @@ import model_api
 import session_store
 import tools
 from agent_core import ModelReply, run_turn
-from changes import undo_last_edit
+from changes import (
+    list_checkpoints, preview_checkpoint, resolve_turn_id, restore_checkpoint, undo_last_edit,
+)
 from exceptions import (
     AgentAPIError, ModelResponseError, ToolInputError, ToolSecurityError, TurnPersistenceError,
 )
@@ -920,3 +924,174 @@ def test_noop_edit_is_not_reported_as_change(workspace):
         emit=events.append, max_tool_rounds=1,
     ) == "completed"
     assert events[-1]["changes"] == {"files": [], "edits": 0}
+
+
+def _run_edit_turn(calls, session_id="session-test", max_tool_rounds=1):
+    events = []
+
+    def request(messages, allow_tools, emit):
+        call = next(calls, None)
+        return ModelReply(tool_calls=[call]) if call else ModelReply("done")
+
+    assert run_turn(
+        [{"role": "system", "content": "system"}], "edit",
+        request_model=request, dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=max_tool_rounds, session_id=session_id,
+    ) == "completed"
+    return events[-1]["turn_id"]
+
+
+def test_checkpoints_link_session_and_restore(workspace):
+    path = workspace / "file.txt"
+    path.write_text("before\n")
+    turn_id = _run_edit_turn(iter([
+        tool_call("edit", "edit_file", file_path="file.txt", old_text="before", new_text="after"),
+    ]))
+    assert path.read_text() == "after\n"
+    assert resolve_turn_id(turn_id[:8]) == turn_id
+
+    checkpoints = list_checkpoints()
+    assert len(checkpoints) == 1
+    checkpoint = checkpoints[0]
+    assert checkpoint["turn_id"] == turn_id
+    assert checkpoint["session_id"] == "session-test"
+    assert checkpoint["files"] == 1
+    assert checkpoint["paths"] == ["file.txt"]
+    assert checkpoint["edits"] == 1
+
+    assert preview_checkpoint(workspace, turn_id) == [{
+        "path": "file.txt", "status": "restorable",
+        "detail": "可恢复到本轮开始前", "edits": 1,
+    }]
+    result = restore_checkpoint(workspace, turn_id)
+    assert result["restored"] == ["file.txt"]
+    assert result["conflicts"] == []
+    assert path.read_text() == "before\n"
+    assert list_checkpoints() == []
+
+
+def test_checkpoint_collapses_multiple_edits_to_one_file(workspace):
+    path = workspace / "file.txt"
+    path.write_text("v0")
+    turn_id = _run_edit_turn(iter([
+        tool_call("edit1", "edit_file", file_path="file.txt", old_text="v0", new_text="v1"),
+        tool_call("edit2", "edit_file", file_path="file.txt", old_text="v1", new_text="v2"),
+    ]), max_tool_rounds=2)
+    assert path.read_text() == "v2"
+
+    preview = preview_checkpoint(workspace, turn_id)
+    assert preview == [{
+        "path": "file.txt", "status": "restorable",
+        "detail": "可恢复到本轮开始前", "edits": 2,
+    }]
+    result = restore_checkpoint(workspace, turn_id)
+    assert result["restored"] == ["file.txt"]
+    assert path.read_text() == "v0"
+
+
+def test_checkpoint_reports_conflict_and_can_retry(workspace):
+    path = workspace / "file.txt"
+    path.write_text("before")
+    turn_id = _run_edit_turn(iter([
+        tool_call("edit", "edit_file", file_path="file.txt", old_text="before", new_text="after"),
+    ]))
+    path.write_text("manual")
+
+    preview = preview_checkpoint(workspace, turn_id)
+    assert preview[0]["status"] == "conflict"
+    result = restore_checkpoint(workspace, turn_id)
+    assert result["conflicts"] == [{
+        "path": "file.txt",
+        "detail": "文件在本轮修改后发生变化，已保留当前内容",
+    }]
+    assert path.read_text() == "manual"
+    assert len(list_checkpoints()) == 1
+
+    path.write_text("after")
+    result = restore_checkpoint(workspace, turn_id)
+    assert result["restored"] == ["file.txt"]
+    assert path.read_text() == "before"
+
+
+def test_checkpoint_reports_missing_file(workspace):
+    path = workspace / "file.txt"
+    path.write_text("before")
+    turn_id = _run_edit_turn(iter([
+        tool_call("edit", "edit_file", file_path="file.txt", old_text="before", new_text="after"),
+    ]))
+    path.unlink()
+
+    assert preview_checkpoint(workspace, turn_id)[0]["status"] == "missing"
+    result = restore_checkpoint(workspace, turn_id)
+    assert result["conflicts"] == [{"path": "file.txt", "detail": "文件不存在"}]
+    assert not path.exists()
+
+
+def test_checkpoint_restore_deletes_created_file(workspace):
+    path = workspace / "new.txt"
+    turn_id = _run_edit_turn(iter([
+        tool_call("write", "write_file", file_path="new.txt", content="data"),
+    ]))
+    assert path.read_text() == "data"
+
+    assert preview_checkpoint(workspace, turn_id)[0]["status"] == "restorable"
+    result = restore_checkpoint(workspace, turn_id)
+    assert result["restored"] == ["new.txt"]
+    assert not path.exists()
+
+
+def test_checkpoint_commands_preview_and_restore(workspace, monkeypatch, capsys):
+    path = workspace / "file.txt"
+    path.write_text("before")
+    turn_id = _run_edit_turn(iter([
+        tool_call("edit", "edit_file", file_path="file.txt", old_text="before", new_text="after"),
+    ]))
+
+    agent._checkpoint_command(workspace, "")
+    listed = capsys.readouterr().out
+    assert "file.txt" in listed and "1 个文件" in listed
+
+    agent._checkpoint_command(workspace, turn_id[:8])
+    preview = capsys.readouterr().out
+    assert "可恢复" in preview and "file.txt" in preview
+
+    monkeypatch.setattr(agent.Prompt, "ask", lambda *args, **kwargs: "y")
+    agent._restore_command(workspace, turn_id[:8])
+    restored = capsys.readouterr().out
+    assert "已恢复 1 个文件" in restored
+    assert path.read_text() == "before"
+
+
+def test_checkpoint_command_reports_conflict(workspace, capsys):
+    path = workspace / "file.txt"
+    path.write_text("before")
+    turn_id = _run_edit_turn(iter([
+        tool_call("edit", "edit_file", file_path="file.txt", old_text="before", new_text="after"),
+    ]))
+    path.write_text("manual")
+
+    agent._restore_command(workspace, turn_id[:8])
+    output = capsys.readouterr().out
+    assert "冲突" in output
+    assert "文件在本轮修改后发生变化" in output
+    assert path.read_text() == "manual"
+
+
+def test_legacy_file_edit_table_is_migrated(workspace):
+    db = workspace / ".coding_agent_sessions.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """CREATE TABLE file_edits (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL,
+               before BLOB, after_hash BLOB NOT NULL)"""
+        )
+        conn.execute(
+            "INSERT INTO file_edits(path, before, after_hash) VALUES (?, ?, ?)",
+            ("old.txt", None, hashlib.sha256(b"x").digest()),
+        )
+
+    checkpoints = list_checkpoints()
+    assert any(checkpoint["paths"] == ["old.txt"] for checkpoint in checkpoints)
+    with sqlite3.connect(db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(file_edits)")}
+    assert {"session_id", "turn_id", "tool_call_id", "created_at"} <= columns

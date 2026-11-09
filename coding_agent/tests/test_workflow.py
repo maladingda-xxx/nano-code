@@ -67,8 +67,11 @@ def test_find_edit_test_and_retry(workspace):
     calls = iter(actions)
 
     def request(messages, allow_tools, emit):
-        if messages[-1]["role"] == "tool":
-            assert next(expected) in messages[-1]["content"]
+        last = messages[-1]
+        if last["role"] == "user" and last.get("content", "").startswith("仅剩"):
+            last = next(message for message in reversed(messages[:-1]) if message["role"] == "tool")
+        if last["role"] == "tool":
+            assert next(expected) in last["content"]
         call = next(calls, None)
         if call is None:
             assert not allow_tools
@@ -100,6 +103,8 @@ def test_find_edit_test_and_retry(workspace):
     assert events[-1]["status"] == "completed"
     assert events[-1]["reason"] == "tool_round_limit"
     assert events[-1]["verification"] == {"status": "passed", "tool_call_id": "test2", "round": 5}
+    assert events[-1]["changes"] == {"files": ["values.py"], "edits": 2}
+    assert events[-1]["tool_calls"] == 5
 
 
 def test_edit_preserves_crlf_and_undo_protects_manual_changes(workspace):
@@ -414,10 +419,13 @@ def test_invalid_tool_arguments_are_reported_to_model(workspace):
 
     def handler(request):
         messages = json.loads(request.content)["messages"]
-        if messages[-1]["role"] == "user":
+        last = messages[-1]
+        if last["role"] == "user" and last.get("content", "").startswith("仅剩"):
+            last = next(message for message in reversed(messages[:-1]) if message["role"] == "tool")
+        if last["role"] == "user":
             return _completion(None, "tool_calls", [bad_call])
-        assert messages[-1]["tool_call_id"] == "write"
-        assert "工具错误" in messages[-1]["content"]
+        assert last["tool_call_id"] == "write"
+        assert "工具错误" in last["content"]
         return _completion("parameters rejected")
 
     events = []
@@ -684,6 +692,10 @@ def test_cli_checks_budget_after_each_tool_batch(workspace, monkeypatch, capsys,
         body = json.loads(request.content)
         requests.append(body)
         messages = body["messages"]
+        visible = [
+            message for message in messages
+            if not (message["role"] == "user" and message.get("content", "").startswith("仅剩"))
+        ]
         assert messages[0] == requests[0]["messages"][0]
         assert {"role": "user", "content": prompt} in messages
         assert all(message.get("tool_call_id") != "old" for message in messages)
@@ -692,15 +704,15 @@ def test_cli_checks_budget_after_each_tool_batch(workspace, monkeypatch, capsys,
             assert body["max_tokens"] == 1625
             return _completion(None, "tool_calls", first_calls)
         if len(requests) == 2:
-            assert messages[-3]["tool_calls"] == first_calls
-            assert [message["tool_call_id"] for message in messages[-2:]] == ["a", "b"]
-            for message in messages[-2:]:
+            assert visible[-3]["tool_calls"] == first_calls
+            assert [message["tool_call_id"] for message in visible[-2:]] == ["a", "b"]
+            for message in visible[-2:]:
                 assert "工具输出已压缩" in message["content"]
                 assert message["content"].startswith("退出码: 1")
                 assert message["content"].endswith("LAST-ERROR")
             return _completion(None, "tool_calls", [latest_call])
-        assert messages[-2]["tool_calls"] == [latest_call]
-        assert messages[-1]["tool_call_id"] == "c"
+        assert visible[-2]["tool_calls"] == [latest_call]
+        assert visible[-1]["tool_call_id"] == "c"
         assert not any(message.get("tool_call_id") in {"a", "b"} for message in messages)
         return _completion("done")
 
@@ -844,3 +856,67 @@ def test_runtime_notice_keeps_current_tool_batch_when_compacting(monkeypatch):
     assert all("_runtime_notice" not in message for message in fitted)
     assert not any(message.get("content") == "OLD" * 1000 for message in fitted)
     assert events[-1]["reason"] == "context_compacted"
+
+
+def test_low_budget_notice_asks_model_to_commit_changes(workspace):
+    (workspace / "note.txt").write_text("hello")
+    calls = iter([tool_call("read", "read_file", file_path="note.txt")])
+    seen = []
+
+    def request(messages, allow_tools, emit):
+        seen.append((allow_tools, messages[-1]))
+        call = next(calls, None)
+        if call:
+            assert allow_tools
+            return ModelReply(tool_calls=[call])
+        assert allow_tools
+        return ModelReply("done")
+
+    messages = [{"role": "system", "content": "system"}]
+    events = []
+    assert run_turn(
+        messages, "look", request_model=request, dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=3,
+    ) == "completed"
+    assert [allow_tools for allow_tools, _ in seen] == [True, True]
+    reminder = seen[-1][1]
+    assert reminder["role"] == "user"
+    assert "仅剩 2 个工具轮" in reminder["content"]
+    assert all("仅剩" not in (message.get("content") or "") for message in messages)
+    assert events[-1]["changes"] == {"files": [], "edits": 0}
+    assert events[-1]["tool_calls"] == 1
+
+
+def test_turn_end_tracks_successful_write(workspace):
+    calls = iter([tool_call("write", "write_file", file_path="new.txt", content="data")])
+
+    def request(messages, allow_tools, emit):
+        call = next(calls, None)
+        return ModelReply(tool_calls=[call]) if call else ModelReply("done")
+
+    events = []
+    assert run_turn(
+        [{"role": "system", "content": "system"}], "write",
+        request_model=request, dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=1,
+    ) == "completed"
+    assert events[-1]["changes"] == {"files": ["new.txt"], "edits": 1}
+
+
+def test_noop_edit_is_not_reported_as_change(workspace):
+    (workspace / "same.txt").write_text("same")
+    calls = iter([
+        tool_call("edit", "edit_file", file_path="same.txt", old_text="same", new_text="same"),
+    ])
+
+    def request(messages, allow_tools, emit):
+        call = next(calls, None)
+        return ModelReply(tool_calls=[call]) if call else ModelReply("done")
+
+    events = []
+    assert run_turn(
+        [{"role": "system", "content": "system"}], "edit",
+        request_model=request, dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=1,
+    ) == "completed"
+    assert events[-1]["changes"] == {"files": [], "edits": 0}

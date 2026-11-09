@@ -335,6 +335,9 @@ def build_system_prompt(root: Path, directory: Path) -> str:
 
 先收集上下文，再修改，再验证。使用 search_workspace 定位代码，使用 read_file 检查原文。
 修改已有代码优先使用 edit_file，创建文件可用 write_file。文件工具的相对路径以仓库根目录为基准。
+已经定位到具体文件和修改点后，优先提交最小改动，不要反复读取同一文件或继续扩展调查。
+工具轮数有限。收到剩余轮数提示时，不要再扩大调查范围；能修改就立即修改，不能修改就说明当前结论。
+只有实际调用 edit_file 或 write_file 并收到成功结果后，才能声称已修改文件；没有成功结果时必须明确说明尚未修改。
 需要运行测试或构建来验证结果时，使用 execute_command 的 argv 数组并设置 verification=true，一次提交一条命令。
 命令被拒绝时不要通过其他命令绕过。依据实际退出码和输出汇报验证结果。
 若会话记录标记了上轮结果待核查的操作，先核查工作区和命令效果，再决定是否需要重试。
@@ -462,6 +465,12 @@ def _terminal_events():
                 "stale": ("验证后又调用了文件编辑，请重新验证", "yellow"),
             }[verification["status"]]
             console.print(Text(f"  {label}", style))
+            changes = event.get("changes") or {}
+            if changes.get("files"):
+                files = "、".join(changes["files"])
+                console.print(Text(f"  本轮内置文件修改：{files}（{changes['edits']} 次）", "dim"))
+            elif event.get("tool_calls"):
+                console.print(Text("  本轮无内置文件修改", "dim"))
 
     return emit
 

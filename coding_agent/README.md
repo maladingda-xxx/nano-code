@@ -36,7 +36,9 @@ nano-code --env-file /path/to/nano.env
 
 长命令运行时会显示程序已经刷新的 stdout 和 stderr。通过 `COMMAND_TIMEOUT_SECONDS` 可以设置命令默认超时和上限，默认 60 秒。工具请求可用 `timeout_seconds` 选择更短的时间。命令超时或按 `Ctrl+C` 时，Nano Code 会结束受管的进程树并保留已收到的输出。超时和取消的验证结果会标为不确定。
 
-每轮结束时显示最近一次验证的结果。模型通过 `execute_command` 的 `verification: true` 标记测试或构建等验证命令，Nano Code 根据实际退出码判断通过或失败。验证后成功调用内置文件编辑或写入时，需要重新验证。
+每轮结束时显示最近一次验证的结果，以及本轮通过内置文件工具成功编辑或写入的文件。模型通过 `execute_command` 的 `verification: true` 标记测试或构建等验证命令，Nano Code 根据实际退出码判断通过或失败。验证后成功调用内置文件编辑或写入时，需要重新验证。
+
+工具轮数只剩两轮时，Nano Code 会向模型追加一条运行时提示，要求优先提交最小修改或给出当前结论；该提示不写入会话存档。
 
 交互和脚本模式的每次模型请求都按 `CONTEXT_LIMIT_TOKENS` 估算消息和工具定义的占用，并为回复预留空间。超预算时，本地裁剪优先保留项目说明、当前任务和最新的工具批次，长输出可保留首尾。旧轮次可从请求中移除，交互会话存档和进行中的恢复记录保留原文。工具调用及对应结果始终成批保留或移除。必要内容仍无法放入预算时，返回 `context_budget_exceeded`。[Chat Completions 工具消息格式](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
 
@@ -69,7 +71,7 @@ nano-code -p '修复失败的测试并验证' --json --allow-command '["python",
 | `model_request` | `number` 为进程内累计模型请求数，`attempt` 为本次模型调用的尝试序号 |
 | `tool_output` | `stream` 为 `stdout` 或 `stderr`，`text` 是刚收到的输出片段 |
 | `tool_result` | `result` 提供易读文本，`outcome` 提供工具状态、退出码、stdout、stderr、耗时毫秒数和截断标记 |
-| `turn_end` | `status` 表示完成回复、调用出错或中断。 `reason` 提供具体结束原因，包括工具轮数耗尽和无工具降级 |
+| `turn_end` | `status` 表示完成回复、调用出错或中断。 `reason` 提供具体结束原因，包括工具轮数耗尽和无工具降级。`changes` 提供本轮通过内置文件工具成功编辑或写入的文件及次数，`tool_calls` 为本轮工具调用数 |
 | `turn_end.verification` | 记录本轮最近一次显式验证命令及状态。状态包括 `passed`、`failed`、`not_run`、`inconclusive` 和 `stale` |
 
 退出码 `0` 表示模型完成了回复，`1` 表示模型请求失败或没有有效回复，`2` 表示参数或配置错误，`130` 表示中断。脚本可读取 `turn_end.verification` 判断最近一次验证，并通过关联的工具事件查看完整结果。

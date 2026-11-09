@@ -1,5 +1,6 @@
 """Execute a turn independently of the terminal and model API."""
 
+import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from time import perf_counter
@@ -59,6 +60,9 @@ def run_turn(
     status = "completed"
     reason = "reply"
     verification = {"status": "not_run", "tool_call_id": None, "round": None}
+    changes: dict[str, int] = {}
+    tool_calls_made = 0
+    budget_notice_sent = False
     pending = []
     batch = None
     batch_index = 0
@@ -80,6 +84,21 @@ def run_turn(
                 request_messages = [*messages, {
                     "role": "user",
                     "content": "工具调用轮数已用完。请不要再请求工具，基于已有工具结果直接给出最终答复。",
+                    "_runtime_notice": True,
+                }]
+            elif (
+                round_number > 0 and max_tool_rounds - round_number <= 2
+                and not budget_notice_sent
+            ):
+                remaining = max_tool_rounds - round_number
+                budget_notice_sent = True
+                publish({"type": "notice", "text": f"剩余 {remaining} 个工具轮，提示模型优先提交修改。"})
+                request_messages = [*messages, {
+                    "role": "user",
+                    "content": (
+                        f"仅剩 {remaining} 个工具轮。若已定位修改点，请立即提交最小修改；"
+                        "否则基于已有结果给出结论。"
+                    ),
                     "_runtime_notice": True,
                 }]
             publish({"type": "model_start", "round": round_number + 1})
@@ -109,6 +128,7 @@ def run_turn(
             messages.append(batch)
             while pending:
                 call = pending[0]
+                tool_calls_made += 1
                 tool_scope = {"call": call, "tool_call_id": call["id"], "round": round_number + 1}
                 publish({"type": "tool_request", **tool_scope}, durable=True)
                 started = perf_counter()
@@ -126,6 +146,17 @@ def run_turn(
                     "role": "tool", "tool_call_id": call["id"], "content": result.text,
                 })
                 pending.pop(0)
+                if (
+                    result.status == "ok" and call["function"]["name"] in {"edit_file", "write_file"}
+                    and not result.text.startswith("内容相同")
+                ):
+                    try:
+                        arguments = json.loads(call["function"]["arguments"])
+                    except (TypeError, ValueError):
+                        arguments = {}
+                    file_path = arguments.get("file_path") if isinstance(arguments, dict) else None
+                    if isinstance(file_path, str) and file_path:
+                        changes[file_path] = changes.get(file_path, 0) + 1
                 if result.verification is not None:
                     verification = {
                         "status": result.verification, "tool_call_id": call["id"],
@@ -173,7 +204,11 @@ def run_turn(
             reason = "persistence_error"
             publish({"type": "error", "reason": reason, "text": "无法自动保存会话。"})
 
-    end = {"type": "turn_end", "status": status, "reason": reason, "verification": verification}
+    end = {
+        "type": "turn_end", "status": status, "reason": reason, "verification": verification,
+        "changes": {"files": sorted(changes), "edits": sum(changes.values())},
+        "tool_calls": tool_calls_made,
+    }
     try:
         publish(end, durable=reason != "persistence_error")
     except TurnPersistenceError as error:

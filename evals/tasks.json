@@ -1,0 +1,118 @@
+{
+  "repositories": {
+    "nano-code": {
+      "commit": "1190d373343af697e840b2880f056d136fa2c1d9",
+      "pythonpath": "coding_agent"
+    },
+    "itsdangerous": {
+      "url": "https://github.com/pallets/itsdangerous.git",
+      "tag": "2.2.0",
+      "commit": "096c8d42545d3b68ea21a4f890fb2b2d8979c0bd",
+      "pythonpath": "src"
+    }
+  },
+  "tasks": [
+    {
+      "id": "I01",
+      "repository": "itsdangerous",
+      "type": "read",
+      "prompt": "先使用仓库搜索或读取文件工具核对源码。签名字符串缺少分隔符时，Signer 的哪个方法处理它，抛出哪种异常？简要给出仓库相对路径、方法名和异常名。这是一项只读任务。",
+      "evidence": {
+        "src/itsdangerous/signer.py": ["def unsign(", "raise BadSignature("]
+      },
+      "answer_contains": ["src/itsdangerous/signer.py", "unsign", "BadSignature"]
+    },
+    {
+      "id": "N02",
+      "repository": "nano-code",
+      "type": "read",
+      "prompt": "根据源码说明工具执行前的持久化入口，以及强制退出后哪个函数会填补缺失的工具结果。请给出路径、函数名和结果待核查的判定条件。这是一项只读任务。",
+      "evidence": {
+        "coding_agent/agent_core.py": ["durable=True", "tool_request"],
+        "coding_agent/execution_store.py": ["def record_execution(", "def _recovery_history(", "unknown"]
+      },
+      "answer_contains": ["agent_core.py", "execution_store.py", "record_execution", "_recovery_history"]
+    },
+    {
+      "id": "N03",
+      "repository": "nano-code",
+      "type": "bug",
+      "prompt": "修复多行编辑匹配不到纯 CRLF 文件原文的问题。读取工具返回的 LF 文本应能匹配，修改后的文件仍保留 CRLF。运行指定验证用例。",
+      "mutation": {
+        "path": "coding_agent/tools.py",
+        "old": "if \"\\r\\n\" in original and \"\\n\" not in original.replace(",
+        "new": "if \"\\r\\n\" not in original and \"\\n\" not in original.replace("
+      },
+      "verify": ["coding_agent/tests/test_workflow.py::test_edit_preserves_crlf_and_undo_protects_manual_changes"]
+    },
+    {
+      "id": "N04",
+      "repository": "nano-code",
+      "type": "bug",
+      "prompt": "修复小上下文窗口下的回复预留回归。回复预留最多占窗口四分之一，同时保留当前任务和最新工具批次。运行指定验证用例。",
+      "mutation": {
+        "path": "coding_agent/context_budget.py",
+        "old": "output = min(max_output, max(1, limit // 4))",
+        "new": "output = min(max_output, max(1, limit // 2))"
+      },
+      "verify": ["coding_agent/tests/test_workflow.py::test_cli_checks_budget_after_each_tool_batch[False]"]
+    },
+    {
+      "id": "I05",
+      "repository": "itsdangerous",
+      "type": "bug",
+      "prompt": "修复 URL 安全 Base64 解码时无填充字符串无法往返的问题。保留现有输入格式与错误行为，运行指定验证用例。",
+      "mutation": {
+        "path": "src/itsdangerous/encoding.py",
+        "old": "string += b\"=\" * (-len(string) % 4)",
+        "new": "string = string.rstrip(b\"=\")"
+      },
+      "verify": ["tests/test_itsdangerous/test_encoding.py"]
+    },
+    {
+      "id": "I06",
+      "repository": "itsdangerous",
+      "type": "bug",
+      "prompt": "修复 URLSafeSerializer 对需要压缩的载荷无法解码的问题。保持非压缩载荷和带时间戳的序列化行为，运行指定验证用例。",
+      "mutation": {
+        "path": "src/itsdangerous/url_safe.py",
+        "old": "base64d = b\".\" + base64d",
+        "new": "base64d = b\"_\" + base64d"
+      },
+      "fixture": "url_safe_roundtrip.py",
+      "verify": ["nano_eval_test.py"]
+    },
+    {
+      "id": "N07",
+      "repository": "nano-code",
+      "type": "feature",
+      "prompt": "为 search_workspace 增加可选 case_sensitive 参数，默认 true。为 false 时按 Unicode casefold 匹配，保留原始匹配文本和行号。同步工具参数定义与使用文档，运行指定验收测试。",
+      "fixture": "search_case.py",
+      "verify": ["nano_eval_test.py"]
+    },
+    {
+      "id": "I08",
+      "repository": "itsdangerous",
+      "type": "feature",
+      "prompt": "新增公开函数 base64_encoded_size(size)，根据非负字节数计算无填充 URL 安全 Base64 输出长度，无需创建字节串。负数抛出 ValueError，从包根导出并保留现有编码行为。运行指定验收测试。",
+      "fixture": "base64_size.py",
+      "verify": ["nano_eval_test.py", "tests/test_itsdangerous/test_encoding.py"]
+    },
+    {
+      "id": "N09",
+      "repository": "nano-code",
+      "type": "recovery",
+      "prompt": "只在根 README 末尾追加独立一行 RECOVERY-PROBE，然后报告改动。",
+      "procedure": "在隔离副本启动交互模式。观察到目标文件写入后立即强制退出本次 Nano Code 进程，避免等待最终回复。重启并用 /recover 恢复未结束轮次。检查已有结果或待核查标记与实际退出时机相符，README 中的标记恰好一次。",
+      "verify": ["coding_agent/tests/test_workflow.py::test_hard_exit_recovers_work_without_replaying_tools"]
+    },
+    {
+      "id": "N10",
+      "repository": "nano-code",
+      "type": "recovery",
+      "prompt": "只在根 README 末尾追加独立一行 UNDO-PROBE，然后报告改动。",
+      "procedure": "先给隔离副本的 README 加一行 USER-BEFORE，再运行任务。随后手动追加 USER-AFTER，输入 /undo，确认操作提示保留当前内容且两个手工标记都在。手动移除 USER-AFTER 后再次撤销，确认仅 UNDO-PROBE 被撤销。",
+      "verify": ["coding_agent/tests/test_workflow.py::test_edit_preserves_crlf_and_undo_protects_manual_changes"]
+    }
+  ]
+}

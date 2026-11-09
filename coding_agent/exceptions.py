@@ -57,5 +57,12 @@ class ContextBudgetError(AgentAPIError):
     allow_fallback = False
 
 
+class ModelRequestBudgetError(AgentAPIError):
+    """The configured number of provider calls has been exhausted."""
+
+    reason = "model_request_budget_exceeded"
+    allow_fallback = False
+
+
 class TurnPersistenceError(Exception):
     """An execution checkpoint could not be saved or recovered."""

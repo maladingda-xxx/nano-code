@@ -11,6 +11,7 @@ from functools import partial
 from datetime import datetime
 from math import isfinite
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -638,20 +639,27 @@ def main(argv: list[str] | None = None) -> int:
         attempts = int(os.getenv("MAX_RETRIES", "3"))
         retry_delay = float(os.getenv("RETRY_BASE_DELAY", "1"))
         command_timeout = float(os.getenv("COMMAND_TIMEOUT_SECONDS", "60"))
+        configured_requests = os.getenv("MAX_MODEL_REQUESTS")
+        request_limit = int(configured_requests) if configured_requests else None
         if max_rounds < 0 or context_limit <= 0 or attempts <= 0 or retry_delay < 0:
             raise ValueError("轮数、上下文上限和重试配置超出范围。")
         if not isfinite(command_timeout) or command_timeout <= 0:
             raise ValueError("COMMAND_TIMEOUT_SECONDS 必须为大于 0 的有限数值。")
+        if request_limit is not None and request_limit <= 0:
+            raise ValueError("MAX_MODEL_REQUESTS 必须为正整数。")
+        base_url = os.getenv("BASE_URL", "https://api.deepseek.com")
+        official_deepseek = urlsplit(base_url).hostname == "api.deepseek.com"
         model = ChatModel(
             OpenAI(
-                api_key=key, base_url=os.getenv("BASE_URL", "https://api.deepseek.com"),
+                api_key=key, base_url=base_url,
                 max_retries=0, timeout=60,
             ),
-            name=os.getenv("MODEL_NAME", "deepseek-chat"),
+            name=os.getenv("MODEL_NAME", "deepseek-flash" if official_deepseek else "deepseek-chat"),
             temperature=float(os.getenv("TEMPERATURE", "0.7")),
             top_p=float(os.getenv("TOP_P", "1.0")),
             streaming=os.getenv("STREAMING_ENABLED", "true").lower() in ("true", "1", "yes"),
             max_attempts=attempts, retry_delay=retry_delay, tools=TOOLS, context_limit=context_limit,
+            request_limit=request_limit, disable_thinking=official_deepseek,
         )
     except ValueError as error:
         error_console.print(Text(f"配置错误：{error}", "red"))

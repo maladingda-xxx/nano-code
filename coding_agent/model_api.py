@@ -8,7 +8,7 @@ from openai import APIConnectionError, APIStatusError, OpenAI
 
 from agent_core import EventHandler, ModelReply
 from context_budget import fit_request
-from exceptions import AgentAPIError, ModelResponseError
+from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 
 
 def _checked_reply(
@@ -67,7 +67,8 @@ class ChatModel:
     def __init__(
         self, client: OpenAI, name: str, temperature: float, top_p: float,
         streaming: bool, max_attempts: int, retry_delay: float, tools: list[dict],
-        *, context_limit: int = 80000,
+        *, context_limit: int = 80000, request_limit: int | None = None,
+        disable_thinking: bool = False,
     ):
         self.client = client
         self.name = name
@@ -78,13 +79,22 @@ class ChatModel:
         self.retry_delay = retry_delay
         self.tools = tools
         self.context_limit = context_limit
+        self.request_limit = request_limit
+        self.requests_sent = 0
+        self.disable_thinking = disable_thinking
 
     def _create(self, emit: EventHandler, **kwargs: Any) -> Any:
         kwargs["messages"], kwargs["max_tokens"] = fit_request(
             kwargs["messages"], kwargs.get("tools") or [], limit=self.context_limit,
             max_output=kwargs["max_tokens"], emit=emit,
         )
+        if self.disable_thinking:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         for attempt in range(1, self.max_attempts + 1):
+            if self.request_limit is not None and self.requests_sent >= self.request_limit:
+                raise ModelRequestBudgetError(f"已达到模型请求上限（{self.request_limit} 次）。")
+            self.requests_sent += 1
+            emit({"type": "model_request", "number": self.requests_sent, "attempt": attempt})
             try:
                 return self.client.chat.completions.create(model=self.name, **kwargs)
             except (APIConnectionError, APIStatusError) as error:
@@ -93,6 +103,10 @@ class ChatModel:
                 )
                 if not retryable or attempt == self.max_attempts:
                     raise AgentAPIError(f"模型请求失败: {error}") from error
+                if self.requests_sent == self.request_limit:
+                    raise ModelRequestBudgetError(
+                        f"请求失败且已达到模型请求上限（{self.request_limit} 次）。"
+                    ) from error
                 delay = self.retry_delay * 2 ** (attempt - 1) + random.uniform(0, 1)
                 emit({"type": "notice", "text": f"模型请求失败，{delay:.1f} 秒后重试。"})
                 time.sleep(delay)

@@ -12,6 +12,7 @@ from openai import OpenAI
 
 import agent
 import context_budget
+import model_api
 import session_store
 import tools
 from agent_core import ModelReply, run_turn
@@ -27,6 +28,8 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(tools, "_workspace_root", tmp_path)
     monkeypatch.setattr(session_store, "_workspace_root", tmp_path)
+    monkeypatch.setattr(agent, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.delenv("MAX_MODEL_REQUESTS", raising=False)
     return tmp_path
 
 
@@ -184,6 +187,8 @@ def test_cli_json_with_an_openai_compatible_response(workspace, monkeypatch, cap
         body = json.loads(request.content)
         assert body["messages"][-1] == {"role": "user", "content": "hello"}
         assert body["tools"]
+        assert body["model"] == "deepseek-flash"
+        assert body["thinking"] == {"type": "disabled"}
         return httpx.Response(200, json={
             "id": "reply", "object": "chat.completion", "created": 1, "model": "fake",
             "choices": [{"index": 0, "finish_reason": "stop",
@@ -191,6 +196,8 @@ def test_cli_json_with_an_openai_compatible_response(workspace, monkeypatch, cap
         })
 
     monkeypatch.setenv("API_KEY", "test")
+    monkeypatch.setenv("BASE_URL", "https://api.deepseek.com")
+    monkeypatch.delenv("MODEL_NAME", raising=False)
     monkeypatch.setenv("STREAMING_ENABLED", "false")
     monkeypatch.setattr(agent, "OpenAI", lambda **kwargs: OpenAI(
         **kwargs, http_client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -747,3 +754,29 @@ def test_budget_exhaustion_stops_before_provider_call(monkeypatch, include_tools
     ) == "error"
     assert events[-1]["reason"] == "context_budget_exceeded"
     assert all(event["type"] not in {"tool_request", "reply"} for event in events)
+
+
+def test_model_request_limit_counts_retries_and_blocks_fallback(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            503 if len(requests) == 1 else 400, json={"error": {"message": "test"}},
+        )
+
+    monkeypatch.setattr(model_api.time, "sleep", lambda delay: None)
+    client = OpenAI(
+        api_key="test", base_url="https://provider.test/v1", max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    model = ChatModel(client, "fake", 0, 1, False, 3, 0, tools.TOOLS, request_limit=2)
+    events = []
+    assert run_turn(
+        [], "hello", request_model=model, dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=2,
+    ) == "error"
+    assert len(requests) == 2
+    assert all(body.get("tools") and "thinking" not in body for body in requests)
+    assert [event["number"] for event in events if event["type"] == "model_request"] == [1, 2]
+    assert events[-1]["reason"] == "model_request_budget_exceeded"

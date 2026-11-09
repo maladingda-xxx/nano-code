@@ -11,7 +11,7 @@ cd coding_agent
 python -m pip install .
 ```
 
-将 [.env.example](.env.example) 复制到自己管理的位置并填入 `API_KEY`。默认模型是 `deepseek-chat`，可用 `MODEL_NAME` 和 `BASE_URL` 指定兼容服务。已有环境变量优先于配置文件。
+将 [.env.example](.env.example) 复制到自己管理的位置并填入 `API_KEY`。官方 DeepSeek 默认使用 `deepseek-flash`，工具调用采用非思考模式。可用 `MODEL_NAME` 和 `BASE_URL` 指定其他兼容服务。已有环境变量优先于配置文件。 [DeepSeek 模型与工具调用](https://api-docs.deepseek.com/guides/tool_calls/)
 
 ```sh
 nano-code --env-file /path/to/nano.env
@@ -66,12 +66,15 @@ nano-code -p '修复失败的测试并验证' --json --allow-command '["python",
 
 | 事件 | 字段 |
 | --- | --- |
+| `model_request` | `number` 为进程内累计模型请求数，`attempt` 为本次模型调用的尝试序号 |
 | `tool_output` | `stream` 为 `stdout` 或 `stderr`，`text` 是刚收到的输出片段 |
 | `tool_result` | `result` 提供易读文本，`outcome` 提供工具状态、退出码、stdout、stderr、耗时毫秒数和截断标记 |
 | `turn_end` | `status` 表示完成回复、调用出错或中断。 `reason` 提供具体结束原因，包括工具轮数耗尽和无工具降级 |
 | `turn_end.verification` | 记录本轮最近一次显式验证命令及状态。状态包括 `passed`、`failed`、`not_run`、`inconclusive` 和 `stale` |
 
 退出码 `0` 表示模型完成了回复，`1` 表示模型请求失败或没有有效回复，`2` 表示参数或配置错误，`130` 表示中断。脚本可读取 `turn_end.verification` 判断最近一次验证，并通过关联的工具事件查看完整结果。
+
+可用 `MAX_MODEL_REQUESTS` 限制单个 Nano Code 进程的模型请求数。重试和降级计入上限，耗尽时返回 `model_request_budget_exceeded`。 [固定任务集与首轮联调](../evals/README.md)
 
 流式文本在接收过程中以 `text_delta` 输出，完整回复通过 `reply` 确认。截断、断流、缺少结束标记或工具调用结构不完整时，`error` 与 `turn_end.reason` 会给出原因，已显示的文本仅供预览。结构完整的工具调用若参数 JSON 有误，会返回 `invalid_arguments`，模型可以据此修正。请求本身失败时仍可尝试无工具模式，降级回复也需通过完整性检查。
 

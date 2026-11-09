@@ -18,6 +18,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from agent_core import ToolResult
 from changes import read_bytes, record_edit
 from session_store import set_session_root
 from workspace import workspace_path
@@ -369,7 +370,7 @@ _BLOCKED_PROGRAMS = {
 _SHELL_OPERATORS = {"&", "&&", "|", "||", ";", "<", ">", ">>"}
 
 
-def _command_output(stream) -> str:
+def _command_output(stream) -> tuple[str, bool]:
     size = stream.seek(0, os.SEEK_END)
     stream.seek(max(0, size - 14_000))
     data = stream.read()
@@ -378,8 +379,8 @@ def _command_output(stream) -> str:
     except UnicodeDecodeError:
         output = data.decode(locale.getpreferredencoding(False), errors="replace")
     if size > len(data) or len(output) > 3500:
-        return "…（前文已截断）\n" + output[-3500:]
-    return output
+        return "…（前文已截断）\n" + output[-3500:], True
+    return output, False
 
 
 def execute_command(
@@ -389,6 +390,16 @@ def execute_command(
     cwd: str = ".",
     confirm: Callable[[list[str], Path], bool] | None = None,
 ) -> str:
+    return run_command(command, argv=argv, cwd=cwd, confirm=confirm).text
+
+
+def run_command(
+    command: str | None = None,
+    *,
+    argv: list[str] | None = None,
+    cwd: str = ".",
+    confirm: Callable[[list[str], Path], bool] | None = None,
+) -> ToolResult:
     """Run one explicitly approved executable and report its status and output."""
     tool = "execute_command"
     if argv is None and isinstance(command, str):
@@ -417,7 +428,7 @@ def execute_command(
     if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
         raise ToolSecurityError("Windows 下请直接调用可执行程序，例如 python -m pytest。", tool_name=tool)
     if confirm is None or not confirm(argv, directory):
-        return "命令未获授权，未执行。"
+        return ToolResult("命令未获授权，未执行。", status="denied")
 
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -425,17 +436,22 @@ def execute_command(
                 [executable, *argv[1:]], cwd=directory, stdin=subprocess.DEVNULL,
                 stdout=stdout, stderr=stderr, timeout=60,
             )
-            outputs = [("stdout", _command_output(stdout)), ("stderr", _command_output(stderr))]
+            stdout_text, stdout_truncated = _command_output(stdout)
+            stderr_text, stderr_truncated = _command_output(stderr)
     except subprocess.TimeoutExpired as error:
         raise ToolTimeoutError("命令执行超过 60 秒。", tool_name=tool) from error
     except OSError as error:
         raise ToolExecutionError(f"无法执行命令: {error}", tool_name=tool) from error
 
     parts = [f"退出码: {result.returncode}"]
-    for label, output in outputs:
+    for label, output in (("stdout", stdout_text), ("stderr", stderr_text)):
         if output:
             parts.append(f"[{label}]\n{output.rstrip()}")
-    return "\n".join(parts)
+    return ToolResult(
+        "\n".join(parts), status="ok" if result.returncode == 0 else "failed",
+        exit_code=result.returncode, stdout=stdout_text, stderr=stderr_text,
+        truncated=stdout_truncated or stderr_truncated,
+    )
 
 
 def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
@@ -643,6 +659,10 @@ TOOLS: list[dict] = [
                         "description": "程序名与参数，例如 [\"python\", \"-m\", \"pytest\"]",
                     },
                     "cwd": {"type": "string", "description": "工作区内的目录，默认仓库根目录"},
+                    "verification": {
+                        "type": "boolean",
+                        "description": "用于验证任务结果的命令填 true，例如运行测试或构建。",
+                    },
                 },
                 "required": ["argv"],
             },

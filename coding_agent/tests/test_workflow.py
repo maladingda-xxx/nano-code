@@ -47,10 +47,10 @@ def test_find_edit_test_and_retry(workspace):
         tool_call("search", "search_workspace", query="def cap"),
         tool_call("edit1", "edit_file", file_path="values.py",
                   old_text="min(value, 10)", new_text="min(value, 9)"),
-        tool_call("test1", "execute_command", argv=command),
+        tool_call("test1", "execute_command", argv=command, verification=True),
         tool_call("edit2", "edit_file", file_path="values.py",
                   old_text="min(value, 9)", new_text="min(value, 8)"),
-        tool_call("test2", "execute_command", argv=command),
+        tool_call("test2", "execute_command", argv=command, verification=True),
     ]
     expected = iter(["values.py:1", "+    return min(value, 9)", "退出码: 1",
                      "+    return min(value, 8)", "退出码: 0"])
@@ -60,6 +60,8 @@ def test_find_edit_test_and_retry(workspace):
         if messages[-1]["role"] == "tool":
             assert next(expected) in messages[-1]["content"]
         call = next(calls, None)
+        if call is None:
+            assert not allow_tools
         return ModelReply(tool_calls=[call]) if call else ModelReply("测试通过")
 
     events = []
@@ -77,7 +79,17 @@ def test_find_edit_test_and_retry(workspace):
         {key: value for key, value in message.items() if value is not None}
         for message in messages
     ]
-    assert events[-1] == {"type": "turn_end", "status": "completed"}
+    results = {
+        event["tool_call_id"]: event["outcome"]
+        for event in events if event["type"] == "tool_result"
+    }
+    assert results["test1"]["verification"] == "failed"
+    assert results["test1"]["exit_code"] == 1
+    assert results["test2"]["verification"] == "passed"
+    assert results["test2"]["exit_code"] == 0
+    assert events[-1]["status"] == "completed"
+    assert events[-1]["reason"] == "tool_round_limit"
+    assert events[-1]["verification"] == {"status": "passed", "tool_call_id": "test2", "round": 5}
 
 
 def test_edit_preserves_crlf_and_undo_protects_manual_changes(workspace):
@@ -157,7 +169,9 @@ def test_interrupt_pairs_every_pending_call_and_saves_history(workspace):
     assert dispatched == ["a"]
     assert [m["tool_call_id"] for m in session_store.load_session("__auto__")
             if m["role"] == "tool"] == ["a", "b"]
-    assert events[-1] == {"type": "turn_end", "status": "interrupted"}
+    assert events[-1]["type"] == "turn_end"
+    assert events[-1]["status"] == "interrupted"
+    assert events[-1]["reason"] == "user_interrupt"
 
 
 def test_cli_json_with_an_openai_compatible_response(workspace, monkeypatch, capsys):
@@ -178,8 +192,59 @@ def test_cli_json_with_an_openai_compatible_response(workspace, monkeypatch, cap
     ))
     assert agent.main(["-p", "hello", "--json"]) == 0
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert {"type": "reply", "text": "world"} in events
-    assert events[-1] == {"type": "turn_end", "status": "completed"}
+    assert any(event["type"] == "reply" and event["text"] == "world" for event in events)
+    assert events[-1]["type"] == "turn_end"
+    assert events[-1]["status"] == "completed"
+    assert events[-1]["verification"]["status"] == "not_run"
+    assert len({event["session_id"] for event in events}) == 1
+    assert len({event["turn_id"] for event in events}) == 1
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_json_reports_verification_independently_of_cli_exit(workspace, monkeypatch, capsys, allowed):
+    argv = ["python", "-c", "import sys; print('x' * 3600); print('failure', file=sys.stderr); sys.exit(3)"]
+    call = tool_call("verify", "execute_command", argv=argv, verification=True)
+    replies = iter([ModelReply(tool_calls=[call]), ModelReply("已完成本轮")])
+    monkeypatch.setenv("API_KEY", "test")
+    monkeypatch.setenv("MAX_TOOL_ROUNDS", "2")
+    monkeypatch.setattr(agent, "ChatModel", lambda *args, **kwargs: lambda *_: next(replies))
+    args = ["-p", "run the verification", "--json"]
+    if allowed:
+        args.extend(["--allow-command", json.dumps(argv)])
+    assert agent.main(args) == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    request = next(event for event in events if event["type"] == "tool_request")
+    result = next(event for event in events if event["type"] == "tool_result")
+    for key in ("session_id", "turn_id", "round", "tool_call_id"):
+        assert request[key] == result[key]
+    outcome = result["outcome"]
+    assert outcome["elapsed_ms"] >= 0
+    if allowed:
+        assert outcome["status"] == "failed"
+        assert outcome["exit_code"] == 3
+        assert outcome["stdout"].startswith("…（前文已截断）")
+        assert outcome["stderr"].strip() == "failure"
+        assert outcome["truncated"]
+    else:
+        assert outcome["status"] == "denied"
+        assert outcome["exit_code"] is None
+    assert events[-1]["verification"]["status"] == ("failed" if allowed else "not_run")
+
+
+def test_edit_after_verification_requires_a_new_check(workspace):
+    calls = [
+        tool_call("verify", "execute_command", argv=["python", "-V"], verification=True),
+        tool_call("write", "write_file", file_path="a.txt", content="after the check"),
+    ]
+    replies = iter([ModelReply(tool_calls=calls), ModelReply("修改后需重新验证")])
+    events = []
+    run_turn(
+        [], "write after verifying", request_model=lambda *_: next(replies),
+        dispatch=lambda call: agent.execute_tool_call(call, confirm=lambda *_: True),
+        emit=events.append, max_tool_rounds=2,
+    )
+    assert events[-1]["verification"] == {"status": "stale", "tool_call_id": "verify", "round": 1}
 
 
 def test_session_load_can_read_legacy_subdirectory_save(workspace, monkeypatch):

@@ -6,9 +6,11 @@ import os
 import sys
 import time
 from collections import Counter
+from dataclasses import replace
 from functools import partial
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 try:
     import tiktoken
@@ -24,12 +26,12 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
-from agent_core import EventHandler, run_turn
+from agent_core import EventHandler, ToolResult, run_turn
 from changes import undo_last_edit
-from exceptions import AgentAPIError, ToolError
+from exceptions import AgentAPIError, ToolError, ToolInputError, ToolSecurityError, ToolTimeoutError
 from model_api import ChatModel
 from session_store import auto_save, list_saved_sessions, load_session, save_session
-from tools import AVAILABLE_TOOLS, TOOLS, execute_command, set_workspace_root
+from tools import AVAILABLE_TOOLS, TOOLS, run_command, set_workspace_root
 from workspace import find_root, read_project_instructions
 
 
@@ -332,7 +334,7 @@ def build_system_prompt(root: Path, directory: Path) -> str:
 
 先收集上下文，再修改，再验证。使用 search_workspace 定位代码，使用 read_file 检查原文。
 修改已有代码优先使用 edit_file，创建文件可用 write_file。文件工具的相对路径以仓库根目录为基准。
-需要运行测试时，使用 execute_command 的 argv 数组，一次提交一条命令。
+需要运行测试或构建来验证结果时，使用 execute_command 的 argv 数组并设置 verification=true，一次提交一条命令。
 命令被拒绝时不要通过其他命令绕过。依据实际退出码和输出汇报验证结果。
 需求不明确时可使用 ask_followup_question。优先给出简洁、可核查的结论。"""
     if instructions:
@@ -496,26 +498,53 @@ def compress_messages(
     return compressed
 
 
-def execute_tool_call(call: dict, *, confirm=None, interactive: bool = False) -> str:
+def execute_tool_call(call: dict, *, confirm=None, interactive: bool = False) -> ToolResult:
     name = call["function"]["name"]
     if name not in AVAILABLE_TOOLS:
-        return f"错误：未知工具 {name}。"
+        return ToolResult(f"错误：未知工具 {name}。", status="error")
     if name == "ask_followup_question" and not interactive:
-        return "当前为非交互模式，请根据已有信息作答，或在回复中提出需要澄清的问题。"
+        return ToolResult(
+            "当前为非交互模式，请根据已有信息作答，或在回复中提出需要澄清的问题。",
+            status="denied",
+        )
+    is_verification = False
     try:
         arguments = json.loads(call["function"]["arguments"])
         if not isinstance(arguments, dict):
-            return "参数错误：工具参数必须是 JSON 对象。"
+            raise ToolInputError("工具参数必须是 JSON 对象。")
         if name == "execute_command":
-            result = execute_command(**arguments, confirm=confirm)
+            flag = arguments.pop("verification", False)
+            if not isinstance(flag, bool):
+                raise ToolInputError("verification 必须为布尔值。")
+            is_verification = flag
+            result = run_command(**arguments, confirm=confirm)
         else:
-            result = AVAILABLE_TOOLS[name](**arguments)
-    except (ToolError, ValueError, TypeError) as error:
-        return f"工具错误：{error}"
+            result = ToolResult(
+                AVAILABLE_TOOLS[name](**arguments),
+                invalidates_verification=name in {"edit_file", "write_file"},
+            )
+    except KeyboardInterrupt:
+        result = ToolResult("用户中断了工具调用，请先检查工作区再决定是否重试。", status="interrupted")
+    except (ToolInputError, ValueError, TypeError) as error:
+        result = ToolResult(f"工具错误：{error}", status="invalid_arguments")
+    except ToolSecurityError as error:
+        result = ToolResult(f"工具错误：{error}", status="blocked")
+    except ToolTimeoutError as error:
+        result = ToolResult(f"工具错误：{error}", status="timeout")
+    except ToolError as error:
+        result = ToolResult(f"工具错误：{error}", status="error")
     except Exception as error:
-        return f"工具执行异常：{error}"
-    if len(result) > 8000:
-        return result[:8000] + "\n（输出已截断。）"
+        result = ToolResult(f"工具执行异常：{error}", status="error")
+    if is_verification:
+        if result.exit_code is not None:
+            verification = "passed" if result.exit_code == 0 else "failed"
+        elif result.status in {"denied", "blocked", "invalid_arguments"}:
+            verification = "not_run"
+        else:
+            verification = "inconclusive"
+        result = replace(result, verification=verification)
+    if len(result.text) > 8000:
+        result = replace(result, text=result.text[:8000] + "\n（输出已截断。）", truncated=True)
     return result
 
 
@@ -542,7 +571,7 @@ def _terminal_events():
         elif kind == "tool_result":
             function = event["call"]["function"]
             result = event["result"]
-            if function["name"] in {"edit_file", "execute_command"} or result.startswith("工具错误"):
+            if function["name"] in {"edit_file", "execute_command"} or event["outcome"]["status"] != "ok":
                 console.print(Text(result))
             else:
                 console.print(f"  [dim]返回 {len(result)} 字符[/dim]")
@@ -550,8 +579,19 @@ def _terminal_events():
             console.print(f"  [dim]用量 {event['total_tokens']} tokens[/dim]")
         elif kind in {"error", "notice"}:
             console.print(Text(event["text"], "red" if kind == "error" else "yellow"))
-        elif kind == "turn_end" and event["status"] == "interrupted":
-            console.print("  [yellow]本轮已中断，可以继续输入。[/yellow]")
+        elif kind == "turn_end":
+            if event["status"] == "interrupted":
+                console.print("  [yellow]本轮已中断，可以继续输入。[/yellow]")
+            verification = event["verification"]
+            missing = "最近一次验证未运行" if verification["tool_call_id"] else "本轮未运行验证"
+            label, style = {
+                "passed": ("最近一次验证通过", "green"),
+                "failed": ("最近一次验证失败", "red"),
+                "not_run": (missing, "dim"),
+                "inconclusive": ("最近一次验证没有得到结果", "yellow"),
+                "stale": ("验证后又调用了文件编辑，请重新验证", "yellow"),
+            }[verification["status"]]
+            console.print(Text(f"  {label}", style))
 
     return emit
 
@@ -580,6 +620,7 @@ def _run_interactive(
         messages.extend(saved[1:] if saved[0]["role"] == "system" else saved)
 
     session_start = time.time()
+    session_id = uuid4().hex
     while True:
         try:
             user_input = Prompt.ask("\n[bold green]▸[/bold green] 你").strip()
@@ -595,6 +636,7 @@ def _run_interactive(
             return 0
         if command == "/clear":
             messages[:] = [system]
+            session_id = uuid4().hex
             auto_save(messages)
             console.print("上下文已清空。")
         elif command == "/help":
@@ -619,6 +661,7 @@ def _run_interactive(
             loaded = load_session(name)
             if loaded:
                 messages[:] = [system, *(loaded[1:] if loaded[0]["role"] == "system" else loaded)]
+                session_id = uuid4().hex
                 auto_save(messages)
                 console.print(Text(f"已加载会话 {name}。"))
             else:
@@ -628,7 +671,10 @@ def _run_interactive(
             run_turn(
                 messages, user_input, request_model=model, dispatch=_interactive_dispatch(),
                 emit=emit, max_tool_rounds=max_rounds, save=auto_save,
-                prepare=lambda history: compress_messages(history, context_limit, model, emit),
+                session_id=session_id,
+                prepare_with_events=lambda history, publish: compress_messages(
+                    history, context_limit, model, publish,
+                ),
             )
 
 

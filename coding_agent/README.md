@@ -1,128 +1,64 @@
-# Coding Agent
+# Nano Code
 
-一个从零手写的 Python Coding Agent，不依赖任何 Agent 框架（LangChain 等），使用 OpenAI 兼容 API。
+Nano Code 是一个 Python 终端编程助手。它通过 OpenAI 兼容 API 调用模型，在仓库里搜索和阅读代码、局部编辑文件、运行获授权的测试命令，并展示实际差异和退出码。
 
-## 功能
+## 安装和配置
 
-- 🤖 终端交互式对话，Agent 可以主动调用工具完成任务
-- 📖 **read_file** — 读取文件内容，带行号，支持行号范围
-- 📂 **list_directory** — 列出目录内容，标注文件和目录
-- 🔍 **search_in_file** — 在文件中搜索关键词，带上下文
-- ⚙️ **execute_command** — 执行安全的 shell 命令（三级安全分级）
-- ✏️ **write_file** — 创建或修改文件（支持覆盖/追加，路径沙盒保护）
-- ❓ **ask_followup_question** — 不确定时主动向用户澄清
-- 📦 智能上下文压缩（三级策略：轻量 / 中度滑动窗口 / 重度 LLM 摘要）
-- ⚡ 流式输出（实时逐字显示文本响应）
-- 🔄 API 重试（指数退避，最多 3 次）
-- 💾 会话持久化（SQLite，自动存档 + 手动命名保存 / 恢复）
-- 📊 实时显示 token 用量
-- 🛡️ 结构化异常体系（工具错误有明确类型）
+需要 Python 3.11+ 和一个兼容 OpenAI Chat Completions 的服务。安装后，从要操作的仓库运行 `nano-code`。
 
-## 环境要求
-
-- Python 3.11+
-- 一个兼容 OpenAI API 格式的服务（DeepSeek、OpenAI 等）
-
-## 安装
-
-```bash
-# 1. 进入项目目录
+```sh
 cd coding_agent
-
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. 配置环境变量
-cp .env.example .env
-# 编辑 .env，填入你的 API_KEY
-
-# 4. 运行
-python agent.py
+python -m pip install .
 ```
 
-## 配置说明
+将 [.env.example](.env.example) 复制到自己管理的位置并填入 `API_KEY`。默认模型是 `deepseek-chat`，可用 `MODEL_NAME` 和 `BASE_URL` 指定兼容服务。已有环境变量优先于配置文件。
 
-编辑 `.env` 文件：
-
-```ini
-# --- API 配置（必填）---
-API_KEY=sk-your-api-key-here
-
-# 模型名称
-MODEL_NAME=deepseek-chat
-
-# API 地址
-BASE_URL=https://api.deepseek.com
-
-# --- 模型参数 ---
-TEMPERATURE=0.7          # 温度（0-2）
-TOP_P=1.0                # Top-P 采样
-
-# --- 流式输出 ---
-STREAMING_ENABLED=true   # 开启后文本响应实时逐字显示
-
-# --- API 重试 ---
-MAX_RETRIES=3            # 最大重试次数
-RETRY_BASE_DELAY=1.0     # 重试基础延迟（秒）
-
-# --- 会话管理 ---
-MAX_TOOL_ROUNDS=5        # 最大工具调用轮数
-MAX_RECENT_ROUNDS=10     # 上下文窗口保留轮数
-CONTEXT_LIMIT_TOKENS=80000  # 上下文 token 上限
+```sh
+nano-code --env-file /path/to/nano.env
 ```
 
-## 特殊命令
+也可直接设置环境变量后运行 `nano-code`。从源码启动时仍支持在 `agent.py` 旁放置 `.env`，然后运行 `python agent.py`。环境变量模板列出了流式输出、工具轮数、上下文和 API 重试选项。
 
-| 命令 | 作用 |
-|------|------|
-| `/exit` | 退出程序（自动保存会话） |
-| `/clear` | 清空对话上下文 |
-| `/help` | 显示帮助信息 |
-| `/stats` | 查看当前会话统计 |
-| `/save <名称>` | 保存当前会话为命名存档 |
-| `/load <名称>` | 加载命名存档 |
-| `/sessions` | 列出所有已保存的会话 |
+## 在仓库里使用
 
-## 安全说明
+启动后可以输入“找到失败的测试，做最小修改，再运行这个测试”。Nano Code 会读取从仓库根目录到启动目录的 `AGENTS.md`，并以仓库根目录解释文件工具中的相对路径。无 Git 仓库时以启动目录为工作区。
 
-`execute_command` 工具实现了三级安全机制：
+| 工具 | 用途 |
+|---|---|
+| `search_workspace` | 在工作区搜索文本，显示路径和行号。Git 仓库中的未跟踪文件遵循忽略规则。 |
+| `read_file`、`list_directory`、`search_in_file` | 查看文件、目录及单文件内的匹配上下文。 |
+| `edit_file` | 替换一处精确匹配的原文，返回 diff。原文不存在或有多处匹配时会拒绝编辑。 |
+| `write_file` | 创建、覆盖或追加工作区文件。 |
+| `execute_command` | 用参数数组执行单条命令，报告退出码、标准输出和错误输出。 |
+| `ask_followup_question` | 在交互模式下向用户提问。 |
 
-1. **安全命令**（直接执行）：`ls`、`cat`、`grep`、`find`、`git`、`python`、`pytest` 等
-2. **需确认命令**（询问用户后执行）：`pip install`、`npm install`、`curl`、`mv`、`cp` 等
-3. **禁止命令**（直接拒绝）：`rm`、`sudo`、`chmod 777`、fork bomb、管道到 shell 等
+交互模式中，同一轮内相同目录和参数的命令共享一次授权。授权后的程序拥有当前用户的进程权限。文件工具限制在工作区，命令的工作目录也在工作区内。
 
-此外，简单命令优先使用 `shell=False` 执行以增强安全性。
+在模型或工具运行期间按 `Ctrl+C` 可以结束本轮并回到输入框。会话保存在仓库根目录的 `.coding_agent_sessions.db`，下次启动可以选择恢复。SQLite 中的文件快照可能包含源文件的旧内容。
 
-## 项目结构
+| 命令 | 用途 |
+|---|---|
+| `/undo` | 撤销最近一次内置文件编辑或写入。若文件后来被改过，则保留当前内容。命令执行产生的改动在快照范围之外。 |
+| `/save <名称>`、`/load <名称>`、`/sessions` | 保存、恢复和列出会话。 |
+| `/clear`、`/stats`、`/help`、`/exit` | 清空上下文、查看统计和帮助、退出。 |
 
-```
-coding_agent/
-├── .env.example        # 环境变量模板
-├── .env                # 你的私有配置（不提交到 git）
-├── agent.py            # 主入口，Agent 核心循环
-├── tools.py            # 工具函数 + 工具注册 + JSON Schema
-├── exceptions.py       # 异常体系定义
-├── session_store.py    # 会话持久化（SQLite）
-├── requirements.txt    # 依赖声明
-├── pyproject.toml      # 项目元数据
-└── README.md           # 本文件
+## 脚本模式
+
+```sh
+nano-code -p '列出这个仓库的测试入口'
+nano-code -p '修复失败的测试并验证' --json --allow-command '["python","-m","pytest"]'
 ```
 
-## 扩展指南
+`--json` 每行输出一个事件，包括模型文本、工具请求、工具结果和 `turn_end`。默认拒绝运行外部命令，可重复使用 `--allow-command`，按仓库根目录与完整参数数组精确授权。命令参数数组要作为一个完整参数传入。
 
-要新增一个工具，只需在 `tools.py` 中做三件事：
+退出码 `0` 表示模型完成了回复，`1` 表示模型请求失败或没有有效回复，`2` 表示参数或配置错误，`130` 表示中断。测试结果可从对应工具事件的退出码读取。
 
-```python
-# ① 写函数（错误用异常抛出）
-def my_tool(param1: str) -> str:
-    """工具描述"""
-    if not param1:
-        raise ToolInputError("param1 is required", tool_name="my_tool")
-    return f"结果: {param1}"
+## 开发
 
-# ② 注册映射
-AVAILABLE_TOOLS["my_tool"] = my_tool
+`agent_core.py` 负责执行循环并发布事件，`model_api.py` 适配模型响应，`agent.py` 负责终端交互和脚本输出。自定义 Python 入口可用 `tools.register_tool(name, handler, description, parameters)` 添加工具，或在调用 `run_turn` 时传入自己的事件监听器。
 
-# ③ 添加 JSON Schema
-TOOLS.append({...})
+```sh
+cd coding_agent
+python -m pip install -e '.[dev]'
+python -m pytest
 ```

@@ -5,7 +5,7 @@ session_store.py —— 会话持久化（SQLite）
 提供对话历史的保存/恢复能力，让 Agent 退出后可以接着上次的对话继续。
 
 特性：
-  - 自动保存：每次用户输入后自动写入 SQLite
+  - 自动保存：每轮完成或中断后写入 SQLite
   - 启动恢复：检测到上次会话时可选择继续
   - 命名保存：支持 /save <名称> 手动命名保存
   - 加载会话：支持 /load <名称> 加载已命名会话
@@ -17,15 +17,31 @@ session_store.py —— 会话持久化（SQLite）
 import json
 import os
 import sqlite3
-import time
+import sys
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+
+_workspace_root: Path | None = None
+
+
+def set_session_root(root: Path) -> None:
+    global _workspace_root
+    _workspace_root = root
 
 
 def _get_db_path() -> str:
     """获取 SQLite 数据库文件路径。"""
-    cwd = os.getcwd()
-    return os.path.join(cwd, ".coding_agent_sessions.db")
+    return str((_workspace_root or Path.cwd()) / ".coding_agent_sessions.db")
+
+
+def _readable_db_paths():
+    """Prefer repository sessions, then pre-v0.3 sessions in the launch directory."""
+    primary = Path(_get_db_path())
+    legacy = Path.cwd() / primary.name
+    for path in dict.fromkeys((primary, legacy)):
+        if path.is_file():
+            yield path
 
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
@@ -72,11 +88,12 @@ def save_session(name: str, messages: list[dict]) -> bool:
         是否保存成功
     """
     db_path = _get_db_path()
-    conn = sqlite3.connect(db_path)
-    _ensure_tables(conn)
-    conn.execute("PRAGMA foreign_keys = ON")
-
+    conn = None
     try:
+        conn = sqlite3.connect(db_path)
+        _ensure_tables(conn)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # 检查是否存在同名会话
@@ -127,11 +144,12 @@ def save_session(name: str, messages: list[dict]) -> bool:
         )
         conn.commit()
         return True
-    except Exception as e:
-        print(f"保存会话失败: {e}")
+    except (sqlite3.Error, TypeError, ValueError) as e:
+        print(f"保存会话失败: {e}", file=sys.stderr)
         return False
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 # ============================================================
@@ -141,7 +159,7 @@ def save_session(name: str, messages: list[dict]) -> bool:
 def auto_save(messages: list[dict]) -> bool:
     """
     自动保存当前会话到默认槽位（名称固定为 '__auto__'）。
-    在每次用户输入后自动调用。
+    在每轮完成或中断后自动调用。
 
     参数:
         messages: 当前消息列表
@@ -166,14 +184,18 @@ def load_session(name: str) -> list[dict] | None:
     返回:
         消息列表，如果会话不存在则返回 None
     """
-    db_path = _get_db_path()
-    if not os.path.exists(db_path):
-        return None
+    for db_path in _readable_db_paths():
+        messages = _load_session_from(db_path, name)
+        if messages is not None:
+            return messages
+    return None
 
-    conn = sqlite3.connect(db_path)
-    _ensure_tables(conn)
 
+def _load_session_from(db_path: Path, name: str) -> list[dict] | None:
+    conn = None
     try:
+        conn = sqlite3.connect(db_path)
+        _ensure_tables(conn)
         session = conn.execute(
             "SELECT id, message_count FROM sessions WHERE name = ? ORDER BY updated_at DESC LIMIT 1",
             (name,),
@@ -203,65 +225,35 @@ def load_session(name: str) -> list[dict] | None:
             messages.append(msg)
 
         return messages
-    except Exception as e:
-        print(f"加载会话失败: {e}")
+    except (sqlite3.Error, ValueError) as e:
+        print(f"加载会话失败: {e}", file=sys.stderr)
         return None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def has_auto_saved_session() -> bool:
-    """检查是否存在自动保存的会话。"""
-    db_path = _get_db_path()
-    if not os.path.exists(db_path):
-        return False
-
-    conn = sqlite3.connect(db_path)
-    _ensure_tables(conn)
-
-    try:
-        row = conn.execute(
-            "SELECT message_count FROM sessions WHERE name = '__auto__'"
-        ).fetchone()
-        return row is not None and row[0] > 0
-    except Exception:
-        return False
-    finally:
-        conn.close()
+    return bool(load_session("__auto__"))
 
 
 def list_saved_sessions() -> list[dict]:
-    """
-    列出所有已保存的会话。
-
-    返回:
-        [{"name": ..., "created_at": ..., "updated_at": ..., "message_count": ...}, ...]
-    """
-    db_path = _get_db_path()
-    if not os.path.exists(db_path):
-        return []
-
-    conn = sqlite3.connect(db_path)
-    _ensure_tables(conn)
-
-    try:
-        rows = conn.execute(
-            "SELECT name, created_at, updated_at, message_count FROM sessions ORDER BY updated_at DESC"
-        ).fetchall()
-
-        return [
-            {
-                "name": name,
-                "created_at": created,
-                "updated_at": updated,
-                "message_count": count,
-            }
-            for name, created, updated, count in rows
-        ]
-    except Exception:
-        return []
-    finally:
-        conn.close()
+    """List sessions with repository entries taking precedence over legacy ones."""
+    sessions = {}
+    for db_path in _readable_db_paths():
+        try:
+            with closing(sqlite3.connect(db_path)) as conn:
+                _ensure_tables(conn)
+                rows = conn.execute(
+                    "SELECT name, created_at, updated_at, message_count FROM sessions"
+                ).fetchall()
+        except sqlite3.Error:
+            continue
+        for name, created, updated, count in rows:
+            sessions.setdefault(name, {
+                "name": name, "created_at": created, "updated_at": updated, "message_count": count,
+            })
+    return sorted(sessions.values(), key=lambda session: session["updated_at"], reverse=True)
 
 
 def delete_session(name: str) -> bool:

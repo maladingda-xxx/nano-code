@@ -1,6 +1,6 @@
 [project]
 name = "coding-agent"
-version = "0.2.0"
+version = "0.3.0"
 description = "从零手写的 Python Coding Agent，不依赖任何 Agent 框架"
 readme = "README.md"
 license = {text = "MIT"}
@@ -22,15 +22,20 @@ dev = [
 ]
 
 [project.scripts]
-coding-agent = "agent:run_agent"
+nano-code = "agent:main"
+coding-agent = "agent:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["agent", "agent_core", "changes", "exceptions", "model_api", "session_store", "tools", "workspace"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"

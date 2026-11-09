@@ -37,3 +37,11 @@ class ToolTimeoutError(ToolError):
 class AgentAPIError(Exception):
     """API 调用层异常（网络错误、重试耗尽等）。"""
     pass
+
+
+class ModelResponseError(AgentAPIError):
+    """The provider replied, but its response cannot complete a model round."""
+
+    def __init__(self, message: str, *, reason: str):
+        super().__init__(message)
+        self.reason = reason

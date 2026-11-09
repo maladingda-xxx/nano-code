@@ -7,7 +7,59 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from agent_core import EventHandler, ModelReply
-from exceptions import AgentAPIError
+from exceptions import AgentAPIError, ModelResponseError
+
+
+def _checked_reply(
+    text: str | None, calls: list[dict], finish_reason: str | None, *, allow_tools: bool,
+) -> ModelReply:
+    if finish_reason == "length":
+        raise ModelResponseError("模型回复达到长度上限，内容已截断。", reason="response_truncated")
+    if finish_reason == "content_filter":
+        raise ModelResponseError("模型回复被服务端内容过滤中止。", reason="response_filtered")
+    if finish_reason is None:
+        raise ModelResponseError("模型回复不完整，缺少结束标记。", reason="incomplete_response")
+    if finish_reason not in {"stop", "tool_calls"}:
+        raise ModelResponseError(
+            f"模型返回了不支持的结束原因：{finish_reason}", reason="unexpected_finish_reason",
+        )
+    if (finish_reason == "tool_calls" and not calls) or (calls and not allow_tools):
+        raise ModelResponseError("模型返回了异常的工具调用。", reason="invalid_tool_calls")
+
+    ids = set()
+    for call in calls:
+        call_id = call.get("id")
+        function = call.get("function")
+        if (
+            call.get("type") != "function"
+            or not isinstance(call_id, str) or not call_id.strip() or call_id in ids
+            or not isinstance(function, dict)
+            or any(
+                not isinstance(function.get(key), str) or not function[key].strip()
+                for key in ("name", "arguments")
+            )
+        ):
+            raise ModelResponseError("模型返回的工具调用不完整或重复。", reason="invalid_tool_calls")
+        ids.add(call_id)
+    if not calls and not (text and text.strip()):
+        raise ModelResponseError("模型未返回有效文本。", reason="empty_response")
+    return ModelReply(text, calls)
+
+
+def _completion_reply(response, *, allow_tools: bool) -> ModelReply:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return _checked_reply(None, [], None, allow_tools=allow_tools)
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    calls = [
+        call.model_dump(include={"id", "type", "function"})
+        for call in (getattr(message, "tool_calls", None) or [])
+    ]
+    return _checked_reply(
+        getattr(message, "content", None), calls, getattr(choice, "finish_reason", None),
+        allow_tools=allow_tools,
+    )
 
 
 class ChatModel:
@@ -41,7 +93,7 @@ class ChatModel:
 
     def summarize(self, messages: list[dict], emit: EventHandler) -> str:
         response = self._create(emit, messages=messages, temperature=0, max_tokens=500)
-        return response.choices[0].message.content if response.choices else ""
+        return _completion_reply(response, allow_tools=False).text or ""
 
     def __call__(self, messages: list[dict], allow_tools: bool, emit: EventHandler) -> ModelReply:
         # Keep the fallback request compatible with endpoints that reject tool calling.
@@ -53,17 +105,11 @@ class ChatModel:
         )
         if streaming:
             return self._stream_reply(response, emit)
-        if not response.choices:
-            return ModelReply()
-        message = response.choices[0].message
+        reply = _completion_reply(response, allow_tools=allow_tools)
         self._emit_usage(response.usage, emit)
-        if message.content:
-            emit({"type": "text_delta", "text": message.content})
-        calls = [
-            {"id": call.id, "type": "function", "function": call.function.model_dump()}
-            for call in (message.tool_calls or [])
-        ]
-        return ModelReply(message.content, calls)
+        if reply.text:
+            emit({"type": "text_delta", "text": reply.text})
+        return reply
 
     @staticmethod
     def _emit_usage(usage, emit: EventHandler) -> None:
@@ -77,31 +123,49 @@ class ChatModel:
         text = []
         calls = {}
         finish_reason = None
-        try:
-            with stream:
-                for chunk in stream:
-                    self._emit_usage(chunk.usage, emit)
-                    if not chunk.choices:
-                        continue
-                    choice = chunk.choices[0]
-                    finish_reason = choice.finish_reason or finish_reason
-                    delta = choice.delta
-                    if delta.content:
-                        text.append(delta.content)
-                        emit({"type": "text_delta", "text": delta.content})
-                    for call in delta.tool_calls or []:
-                        entry = calls.setdefault(call.index, {
-                            "id": "", "type": "function", "function": {"name": "", "arguments": ""},
-                        })
-                        if call.id:
-                            entry["id"] = call.id
-                        if call.function:
-                            entry["function"]["name"] += call.function.name or ""
-                            entry["function"]["arguments"] += call.function.arguments or ""
-        except Exception as error:
-            raise AgentAPIError(f"流式响应中断: {error}") from error
-        if calls and (finish_reason not in {"tool_calls", "stop"} or any(
-            not call["id"] or not call["function"]["name"] for call in calls.values()
-        )):
-            raise AgentAPIError("工具调用流不完整。")
-        return ModelReply("".join(text) or None, [calls[index] for index in sorted(calls)])
+        with stream:
+            chunks = iter(stream)
+            while True:
+                try:
+                    chunk = next(chunks)
+                except StopIteration:
+                    break
+                except Exception as error:
+                    raise ModelResponseError(
+                        f"流式响应中断：{error}", reason="stream_interrupted",
+                    ) from error
+                self._emit_usage(chunk.usage, emit)
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                finish_reason = choice.finish_reason or finish_reason
+                delta = choice.delta
+                if delta is None:
+                    continue
+                if delta.content:
+                    text.append(delta.content)
+                    emit({"type": "text_delta", "text": delta.content})
+                for call in delta.tool_calls or []:
+                    index = getattr(call, "index", None)
+                    if not isinstance(index, int) or index < 0:
+                        raise ModelResponseError("工具调用缺少有效序号。", reason="invalid_tool_calls")
+                    entry = calls.setdefault(index, {
+                        "id": "", "type": "function", "function": {"name": "", "arguments": ""},
+                    })
+                    if call.id:
+                        entry["id"] = call.id
+                    if call.type:
+                        entry["type"] = call.type
+                    if call.function:
+                        for key in ("name", "arguments"):
+                            fragment = getattr(call.function, key)
+                            if fragment is not None:
+                                if not isinstance(fragment, str):
+                                    raise ModelResponseError(
+                                        "工具调用片段格式有误。", reason="invalid_tool_calls",
+                                    )
+                                entry["function"][key] += fragment
+        return _checked_reply(
+            "".join(text) or None, [calls[index] for index in sorted(calls)],
+            finish_reason, allow_tools=True,
+        )

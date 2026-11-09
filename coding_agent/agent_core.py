@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from time import perf_counter
 from uuid import uuid4
 
-from exceptions import AgentAPIError
+from exceptions import AgentAPIError, ModelResponseError
 
 EventHandler = Callable[[dict], None]
 RequestModel = Callable[[list[dict], bool, EventHandler], "ModelReply"]
@@ -68,16 +68,18 @@ def run_turn(
             publish({"type": "model_start", "round": round_number + 1})
             try:
                 reply = request_model(messages, allow_tools, publish)
-            except AgentAPIError:
-                if not allow_tools:
+            except AgentAPIError as error:
+                if not allow_tools or isinstance(error, ModelResponseError):
                     raise
                 publish({"type": "notice", "text": "模型调用失败，正在尝试无工具模式。"})
                 reply = request_model(messages, False, publish)
                 allow_tools = False
                 reason = "model_fallback"
-            if not reply.tool_calls or not allow_tools:
-                if not reply.text:
-                    raise AgentAPIError("模型未返回有效文本。")
+            if reply.tool_calls and not allow_tools:
+                raise ModelResponseError("当前请求未启用工具调用。", reason="invalid_tool_calls")
+            if not reply.tool_calls:
+                if not reply.text or not reply.text.strip():
+                    raise ModelResponseError("模型未返回有效文本。", reason="empty_response")
                 messages.append({"role": "assistant", "content": reply.text})
                 publish({"type": "reply", "text": reply.text})
                 break
@@ -133,8 +135,8 @@ def run_turn(
                 })
     except AgentAPIError as error:
         status = "error"
-        reason = "api_error"
-        publish({"type": "error", "text": str(error)})
+        reason = error.reason if isinstance(error, ModelResponseError) else "api_error"
+        publish({"type": "error", "reason": reason, "text": str(error)})
     finally:
         if save:
             save(messages)

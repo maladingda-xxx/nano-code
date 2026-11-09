@@ -272,7 +272,8 @@ def test_diff_shows_change_to_final_newline(workspace):
 def test_streaming_text_with_tools_and_incomplete_calls(finish_reason):
     function = SimpleNamespace(name="read_file", arguments='{"file_path":"a.txt"}')
     delta = SimpleNamespace(
-        content="Reading.", tool_calls=[SimpleNamespace(index=0, id="read", function=function)],
+        content="Reading.",
+        tool_calls=[SimpleNamespace(index=0, id="read", type="function", function=function)],
     )
     chunk = SimpleNamespace(
         usage=None, choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)],
@@ -296,3 +297,113 @@ def test_streaming_text_with_tools_and_incomplete_calls(finish_reason):
         reply = model._stream_reply(Stream(), lambda event: None)
         assert reply.text == "Reading."
         assert reply.tool_calls[0]["id"] == "read"
+
+
+def _mock_model(handler, *, streaming=False):
+    client = OpenAI(
+        api_key="test", base_url="https://provider.test/v1", max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    return ChatModel(client, "fake", 0, 1, streaming, 1, 0, tools.TOOLS)
+
+
+def _completion(content, finish_reason="stop", calls=None):
+    message = {"role": "assistant", "content": content}
+    if calls is not None:
+        message["tool_calls"] = calls
+    return httpx.Response(200, json={
+        "id": "reply", "object": "chat.completion", "created": 1, "model": "fake",
+        "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
+    })
+
+
+@pytest.mark.parametrize(("ending", "reason"), [
+    ("length", "response_truncated"),
+    ("eof", "incomplete_response"),
+    ("disconnect", "stream_interrupted"),
+    ("incomplete_call", "invalid_tool_calls"),
+])
+def test_incomplete_stream_never_commits_reply_or_dispatches_tool(workspace, ending, reason):
+    delta = {"content": "partial reply"}
+    finish_reason = None
+    if ending == "length":
+        finish_reason = "length"
+    elif ending == "incomplete_call":
+        finish_reason = "tool_calls"
+        delta["tool_calls"] = [{
+            "index": 0, "type": "function",
+            "function": {"name": "write_file", "arguments": '{"file_path":"x","content":"y"}'},
+        }]
+    chunk = {
+        "id": "reply", "object": "chat.completion.chunk", "created": 1, "model": "fake",
+        "choices": [{"index": 0, "finish_reason": finish_reason, "delta": delta}],
+    }
+
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            if ending == "disconnect":
+                raise httpx.ReadError("connection lost")
+
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Stream())
+
+    messages, events = [], []
+    status = run_turn(
+        messages, "hello", request_model=_mock_model(handler, streaming=True),
+        dispatch=agent.execute_tool_call, emit=events.append, max_tool_rounds=2,
+        save=session_store.auto_save,
+    )
+    assert status == "error"
+    assert len(requests) == 1
+    assert events[-1]["reason"] == reason
+    assert any(event["type"] == "text_delta" for event in events)
+    assert all(event["type"] not in {"reply", "tool_request"} for event in events)
+    assert session_store.load_session("__auto__") == [{"role": "user", "content": "hello"}]
+    assert not (workspace / "x").exists()
+
+
+@pytest.mark.parametrize(("finish_reason", "status", "reason"), [
+    ("stop", "completed", "model_fallback"),
+    ("length", "error", "response_truncated"),
+])
+def test_request_failure_falls_back_and_checks_final_reply(finish_reason, status, reason):
+    def handler(request):
+        body = json.loads(request.content)
+        if body.get("tools"):
+            return httpx.Response(400, json={"error": {"message": "tools unsupported"}})
+        assert body["stream"] is False
+        return _completion("fallback", finish_reason)
+
+    events = []
+    assert run_turn(
+        [], "hello", request_model=_mock_model(handler, streaming=True),
+        dispatch=agent.execute_tool_call, emit=events.append, max_tool_rounds=2,
+    ) == status
+    assert events[-1]["reason"] == reason
+    assert any(event["type"] == "reply" for event in events) == (status == "completed")
+
+
+def test_invalid_tool_arguments_are_reported_to_model(workspace):
+    bad_call = tool_call("write", "write_file", file_path="x", content="unexpected")
+    bad_call["function"]["arguments"] = '{"file_path":"x","content":'
+
+    def handler(request):
+        messages = json.loads(request.content)["messages"]
+        if messages[-1]["role"] == "user":
+            return _completion(None, "tool_calls", [bad_call])
+        assert messages[-1]["tool_call_id"] == "write"
+        assert "工具错误" in messages[-1]["content"]
+        return _completion("parameters rejected")
+
+    events = []
+    assert run_turn(
+        [], "hello", request_model=_mock_model(handler), dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=2,
+    ) == "completed"
+    result = next(event for event in events if event["type"] == "tool_result")
+    assert result["outcome"]["status"] == "invalid_arguments"
+    assert not (workspace / "x").exists()

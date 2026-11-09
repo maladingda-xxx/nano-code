@@ -63,6 +63,8 @@ nano-code -p '修复失败的测试并验证' --json --allow-command '["python",
 
 退出码 `0` 表示模型完成了回复，`1` 表示模型请求失败或没有有效回复，`2` 表示参数或配置错误，`130` 表示中断。脚本可读取 `turn_end.verification` 判断最近一次验证，并通过关联的工具事件查看完整结果。
 
+流式文本在接收过程中以 `text_delta` 输出，完整回复通过 `reply` 确认。截断、断流、缺少结束标记或工具调用结构不完整时，`error` 与 `turn_end.reason` 会给出原因，已显示的文本仅供预览。结构完整的工具调用若参数 JSON 有误，会返回 `invalid_arguments`，模型可以据此修正。请求本身失败时仍可尝试无工具模式，降级回复也需通过完整性检查。
+
 ## 开发
 
 `agent_core.py` 负责执行循环并发布事件，`model_api.py` 适配模型响应，`agent.py` 负责终端交互和脚本输出。自定义 Python 入口可用 `tools.register_tool(name, handler, description, parameters)` 添加工具，或在调用 `run_turn` 时传入自己的事件监听器。

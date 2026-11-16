@@ -14,6 +14,40 @@ from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseErro
 TOOL_MARKUP_MARKERS = ("<｜｜DSML｜｜", "<|tool_call|>", "<tool_calls>")
 
 
+class RequestUsage:
+    """Convert one request's cumulative provider reports into usage deltas."""
+
+    def __init__(self, emit: EventHandler):
+        self.emit = emit
+        self.reported: dict[str, int] = {}
+
+    def report(self, input_tokens=None, output_tokens=None, total_tokens=None):
+        counts = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+        if total_tokens is None:
+            parts = [counts[key] if counts[key] is not None else self.reported.get(key)
+                     for key in ("input_tokens", "output_tokens")]
+            if all(isinstance(value, int) for value in parts):
+                counts["total_tokens"] = sum(parts)
+        delta = {}
+        for key, value in counts.items():
+            if type(value) is not int or value < 0:
+                continue
+            previous = self.reported.get(key)
+            if previous is None or value > previous:
+                delta[key] = value - (previous or 0)
+                self.reported[key] = value
+        if delta:
+            self.emit({"type": "usage", **delta})
+
+    def chat(self, usage):
+        if usage is not None:
+            self.report(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+
+
 def _checked_reply(
     text: str | None, calls: list[dict], finish_reason: str | None, *, allow_tools: bool,
 ) -> ModelReply:
@@ -78,7 +112,7 @@ class ChatModel:
         self, client: OpenAI, name: str, temperature: float, top_p: float,
         streaming: bool, max_attempts: int, retry_delay: float, tools: list[dict],
         *, context_limit: int = 80000, request_limit: int | None = None,
-        disable_thinking: bool = False,
+        disable_thinking: bool = False, effort: str | None = None, stream_usage: bool = False,
     ):
         self.client = client
         self.name = name
@@ -92,6 +126,8 @@ class ChatModel:
         self.request_limit = request_limit
         self.requests_sent = 0
         self.disable_thinking = disable_thinking
+        self.effort = effort
+        self.stream_usage = stream_usage
 
     def _create(self, emit: EventHandler, **kwargs: Any) -> Any:
         kwargs["messages"], kwargs["max_tokens"] = fit_request(
@@ -99,15 +135,40 @@ class ChatModel:
             max_output=kwargs["max_tokens"], emit=emit,
         )
         if self.disable_thinking:
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            # The disabled mode is the previous default for official DeepSeek.
+            kwargs["extra_body"] = {"thinking": {"type": "enabled" if self.effort else "disabled"}}
+            if self.effort:
+                kwargs["extra_body"]["reasoning_effort"] = self.effort
+        for message in kwargs["messages"]:
+            if message["role"] != "assistant":
+                continue
+            if self.disable_thinking and self.effort and kwargs.get("tools"):
+                # Sessions created without thinking have no reasoning to replay.
+                message.setdefault("reasoning_content", "")
+            else:
+                message.pop("reasoning_content", None)
+        if kwargs.get("stream") and self.stream_usage:
+            kwargs["stream_options"] = {"include_usage": True}
         for attempt in range(1, self.max_attempts + 1):
             check_cancelled()
             if self.request_limit is not None and self.requests_sent >= self.request_limit:
                 raise ModelRequestBudgetError(f"已达到模型请求上限（{self.request_limit} 次）。")
             self.requests_sent += 1
-            emit({"type": "model_request", "number": self.requests_sent, "attempt": attempt})
+            request_event = {"type": "model_request", "number": self.requests_sent, "attempt": attempt}
+            if self.disable_thinking and self.effort:
+                request_event["effort"] = self.effort
+            emit(request_event)
             try:
-                return self.client.chat.completions.create(model=self.name, **kwargs)
+                response = self.client.chat.completions.create(model=self.name, **kwargs)
+                try:
+                    check_cancelled()
+                except KeyboardInterrupt:
+                    if kwargs.get("stream"):
+                        response.close()
+                    else:
+                        RequestUsage(emit).chat(response.usage)
+                    raise
+                return response
             except (APIConnectionError, APIStatusError) as error:
                 retryable = isinstance(error, APIConnectionError) or (
                     error.status_code in {408, 409, 429} or error.status_code >= 500
@@ -128,6 +189,7 @@ class ChatModel:
 
     def summarize(self, messages: list[dict], emit: EventHandler) -> str:
         response = self._create(emit, messages=messages, temperature=0, max_tokens=500)
+        RequestUsage(emit).chat(response.usage)
         return _completion_reply(response, allow_tools=False).text or ""
 
     def __call__(self, messages: list[dict], allow_tools: bool, emit: EventHandler) -> ModelReply:
@@ -140,24 +202,20 @@ class ChatModel:
         )
         if streaming:
             return self._stream_reply(response, emit)
+        RequestUsage(emit).chat(response.usage)
         reply = _completion_reply(response, allow_tools=allow_tools)
-        self._emit_usage(response.usage, emit)
+        if self.disable_thinking and self.effort:
+            reply.reasoning_content = getattr(response.choices[0].message, "reasoning_content", None)
         if reply.text:
             emit({"type": "text_delta", "text": reply.text})
         return reply
 
-    @staticmethod
-    def _emit_usage(usage, emit: EventHandler) -> None:
-        if usage:
-            emit({
-                "type": "usage", "input_tokens": usage.prompt_tokens,
-                "output_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens,
-            })
-
     def _stream_reply(self, stream, emit: EventHandler) -> ModelReply:
         text = []
+        reasoning = []
         calls = {}
         finish_reason = None
+        usage = RequestUsage(emit)
         with stream:
             chunks = iter(stream)
             while True:
@@ -170,7 +228,8 @@ class ChatModel:
                     raise ModelResponseError(
                         f"流式响应中断：{error}", reason="stream_interrupted",
                     ) from error
-                self._emit_usage(chunk.usage, emit)
+                usage.chat(chunk.usage)
+                check_cancelled()
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -178,6 +237,8 @@ class ChatModel:
                 delta = choice.delta
                 if delta is None:
                     continue
+                if self.disable_thinking and self.effort and getattr(delta, "reasoning_content", None):
+                    reasoning.append(delta.reasoning_content)
                 if delta.content:
                     text.append(delta.content)
                     emit({"type": "text_delta", "text": delta.content})
@@ -201,7 +262,10 @@ class ChatModel:
                                         "工具调用片段格式有误。", reason="invalid_tool_calls",
                                     )
                                 entry["function"][key] += fragment
-        return _checked_reply(
+        reply = _checked_reply(
             "".join(text) or None, [calls[index] for index in sorted(calls)],
             finish_reason, allow_tools=True,
         )
+        if reasoning:
+            reply.reasoning_content = "".join(reasoning)
+        return reply

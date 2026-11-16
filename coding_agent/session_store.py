@@ -75,10 +75,19 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             tool_calls TEXT,
             tool_call_id TEXT,
             name TEXT,
+            reasoning_content TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         )
     """)
+    message_columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "reasoning_content" not in message_columns:
+        try:
+            conn.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT")
+        except sqlite3.OperationalError:
+            # Another session may have migrated the same database in the meantime.
+            if not any(row[1] == "reasoning_content" for row in conn.execute("PRAGMA table_info(messages)")):
+                raise
     conn.commit()
 
 
@@ -153,8 +162,8 @@ def _write_session(
 
         conn.execute(
             """INSERT INTO messages
-               (session_id, seq, role, content, tool_calls, tool_call_id, name, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (session_id, seq, role, content, tool_calls, tool_call_id, name, reasoning_content, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 seq,
@@ -163,6 +172,7 @@ def _write_session(
                 tool_calls_json,
                 msg.get("tool_call_id"),
                 msg.get("name"),
+                msg.get("reasoning_content"),
                 now,
             ),
         )
@@ -235,13 +245,13 @@ def _load_session_record_from(db_path: Path, name: str) -> dict | None:
 
         session_id, uid, _ = session
         rows = conn.execute(
-            "SELECT role, content, tool_calls, tool_call_id, name FROM messages WHERE session_id = ? ORDER BY seq",
+            "SELECT role, content, tool_calls, tool_call_id, name, reasoning_content FROM messages WHERE session_id = ? ORDER BY seq",
             (session_id,),
         ).fetchall()
 
         messages = []
         for row in rows:
-            role, content, tool_calls_json, tool_call_id, tool_name = row
+            role, content, tool_calls_json, tool_call_id, tool_name, reasoning_content = row
             msg = {"role": role}
             if content is not None:
                 msg["content"] = content
@@ -251,6 +261,8 @@ def _load_session_record_from(db_path: Path, name: str) -> dict | None:
                 msg["tool_call_id"] = tool_call_id
             if tool_name:
                 msg["name"] = tool_name
+            if reasoning_content is not None:
+                msg["reasoning_content"] = reasoning_content
             messages.append(msg)
 
         return {"uid": uid or "", "messages": messages}

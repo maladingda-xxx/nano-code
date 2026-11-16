@@ -7,13 +7,16 @@ Nano Code 是参考 Claude Code 交互设计的本地编程助手。它从项目
 在 Nano Code 仓库中执行以下命令。需要 Python 3.11 或更新版本，推荐安装 Git。
 
 ```powershell
-py -3.11 -m pip install -e .\coding_agent
+python -m pip install -e .\coding_agent
+python -m nano_code --version
 nano-code setup
 $env:API_KEY = '<你的模型 API Key>'
 nano-code doctor
 ```
 
-`setup` 保存 API 类型、地址和模型 ID。默认使用 DeepSeek 的 OpenAI 兼容接口。接入其他兼容服务时设置对应的 Base URL 和模型 ID。使用 Anthropic Messages API 时选择 `anthropic`，并设置 `ANTHROPIC_API_KEY` 或 `API_KEY`。如果 `nano-code` 不在 PATH，可以用 `py -3.11 -m nano_code`。
+`setup` 保存 API 类型、地址和模型 ID。默认使用 DeepSeek 的 OpenAI 兼容接口。接入其他兼容服务时设置对应的 Base URL 和模型 ID。使用 Anthropic Messages API 时选择 `anthropic`，并设置 `ANTHROPIC_API_KEY` 或 `API_KEY`。如果 `nano-code` 不在 PATH，可以用安装时的同一个 `python` 运行 `python -m nano_code`。
+
+如果 Windows 上的 `nano-code.exe` 仍从 `agent` 导入，或报找不到 `cancellation`，通常是旧的 0.3 可编辑安装仍然生效。用 `(Get-Command nano-code).Source` 检查启动器所在目录，在对应环境中执行 `python -m pip install -e .\coding_agent`，再执行 `nano-code --version`。例如启动器在 `D:\miniconda3\Scripts` 时，从 Conda `base` 环境安装，或明确使用 `& 'D:\miniconda3\python.exe' -m pip install -e .\coding_agent`。可编辑安装会继续读取仓库里的 `coding_agent/.env`。
 
 模型配置按命令行参数、环境变量、显式 `--env-file`、用户配置文件和内置默认值选取。`~/.nano-code/settings.json` 保存用户设置，`~/.nano-code/.env` 可保存仅供本机使用的凭据。源码安装时继续读取原有 `coding_agent/.env`。受信任的项目可用 `.nano/settings.json` 和 `.nano/settings.local.json` 覆盖用户 JSON 配置。`NANO_CODE_HOME` 可指定其他配置目录。
 
@@ -25,10 +28,12 @@ nano-code doctor
 |---|---|
 | 输入和补全 | Enter 发送，Alt+Enter 或行尾 `\` 后按 Enter 换行。上下键查看历史，`/` 补全命令，`@路径` 附带文件。含空格路径用 `@"目录/文件名"`。 |
 | 运行中的控制 | 可以继续输入，消息按顺序执行。`/queue` 查看队列，`/clear-queue` 清空。Ctrl+C 或 `/cancel` 请求取消当前轮。模型请求等待服务商响应时，取消可能要等到响应或超时。 |
+| 实时状态 | 小号 `composing···` 和药水瓶 `brewing···` 按轮交替，每轮固定一种动画。耗时从提交时开始。`↓` 只显示服务商已报告的输出 token，未报告时显示 `—`。等待授权时显示授权提示。 |
 | 审阅 | `/status` 查看 Git 状态，`/diff` 查看工作区差异，`/diff --staged` 查看暂存差异。`/output` 展开最近一轮工具输出，Ctrl+O 切换展开模式。 |
 | 会话 | `/sessions` 列表，`/resume <名称或 ID>` 恢复，`/rename` 重命名，`/fork` 复制对话。命令行支持 `--continue` 和 `--resume <ID>`。 |
 | 恢复 | `/undo` 回退当前会话的最近一次内置文件编辑。`/checkpoints <轮次 ID>` 预览，`/restore <轮次 ID>` 恢复该轮次。`/recover` 列出异常中断的轮次。 |
 | 上下文 | `/context` 查看估算用量，`/compact` 生成摘要并归档原始会话，`/cost` 查看模型报告的 token 用量，`/export` 导出对话。 |
+| 推理强度 | 直连官方 DeepSeek，使用 `deepseek-flash` 或 `deepseek-v4-pro` 时，`/effort` 查看，`/effort low`、`/effort high`、`/effort max` 切换。`/effort auto` 恢复 Nano Code 默认请求行为。其他组合显示当前阶段。 |
 | 项目约定 | 启动时读取 `CLAUDE.md` 和 `AGENTS.md`，访问不同子目录的文件时读取相应约定。`/init` 生成项目模板，`/memory` 维护项目记忆。 |
 
 恢复时会检查文件是否仍与 Nano Code 当时写入的内容一致，发现冲突会保留当前文件。可恢复范围包括通过 `edit_file` 和 `write_file` 完成的修改。测试命令、MCP 工具和 hooks 造成的外部变更需要用 Git 或对应系统的记录审阅。对话分支共用项目文件。需要独立修改文件时，请从两个 Git worktree 分别启动。

@@ -50,7 +50,7 @@ def diagnostics(session):
     }
 
 
-def execute_command(session, line, renderer):
+def execute_command(session, line, renderer, *, console=None):
     from .ui import COMMANDS, ACCENT, safe_text
     command, _, argument = line.partition(" ")
     argument = argument.strip()
@@ -58,7 +58,7 @@ def execute_command(session, line, renderer):
     readonly = {"/help", "/status", "/diff", "/output", "/context", "/cost", "/tasks", "/skills", "/agents", "/hooks", "/doctor", "/sessions"}
     if session.busy and command not in readonly:
         raise ValueError("当前任务运行中；请等待结束或 /cancel 后操作。")
-    out = renderer.console
+    out = renderer.console if console is None else console
     session._activate()
     if command == "/help":
         table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
@@ -74,7 +74,7 @@ def execute_command(session, line, renderer):
     elif command == "/diff":
         out.print(Syntax(safe_text(session.git_diff(argument == "--staged")), "diff", theme="ansi_dark", word_wrap=True))
     elif command == "/output":
-        renderer.show_output()
+        renderer.show_output(out)
     elif command == "/sessions":
         table = Table("ID", "名称", "消息", "更新时间", box=box.SIMPLE)
         for item in sessions.list_sessions():
@@ -137,12 +137,29 @@ def execute_command(session, line, renderer):
     elif command == "/model":
         if argument:
             session.config.data["model"] = argument
+            session.config.data.pop("effort", None)
             if session.model is not None:
                 client = getattr(session.model, "client", None)
                 if client:
                     client.close()
                 session.model = None
         out.print(Text(f"{session.config.data['provider']} / {session.config.data['model']}"))
+    elif command == "/effort":
+        from .providers import effort_levels
+
+        data = session.config.data
+        levels = effort_levels(data)
+        if not levels:
+            out.print(Text(f"{data['model']} 在当前 API 环境下没有可切换的推理强度。"))
+            return
+        choices = ("auto", *levels)
+        if argument:
+            if argument not in choices:
+                raise ValueError(f"用法：/effort {' | '.join(choices)}")
+            data["effort"] = None if argument == "auto" else argument
+            if session.model is not None:
+                session.model.effort = data["effort"]
+        out.print(Text(f"当前推理强度：{data.get('effort') or 'auto'} · {' / '.join(choices)}"))
     elif command in {"/permissions", "/plan"}:
         if command == "/plan":
             argument = "default" if session.permissions.mode == "plan" else "plan"

@@ -38,6 +38,9 @@ build-backend = "setuptools.build_meta"
 py-modules = ["agent", "agent_core", "cancellation", "changes", "command_runner", "context_budget", "edit_context", "exceptions", "execution_store", "model_api", "session_store", "tools", "windows_job", "workspace"]
 packages = ["nano_code"]
 
+[tool.setuptools.package-data]
+nano_code = ["Items_54.png", "Items_7.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"

@@ -10,7 +10,18 @@ from openai import OpenAI
 from cancellation import check_cancelled
 from context_budget import fit_request
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
-from model_api import ChatModel, _checked_reply
+from model_api import ChatModel, RequestUsage, _checked_reply
+
+
+def effort_levels(data):
+    endpoint = urlsplit(data["base_url"])
+    if (
+        data["provider"] == "openai" and endpoint.scheme == "https"
+        and endpoint.hostname == "api.deepseek.com"
+        and data["model"] in {"deepseek-flash", "deepseek-v4-pro"}
+    ):
+        return ("low", "high", "max")
+    return ()
 
 
 def create_model(config, tools):
@@ -19,11 +30,15 @@ def create_model(config, tools):
         raise ValueError(f"未配置 API Key。请设置 {d['api_key_env']}，或运行 nano-code setup。")
     if d["provider"] == "anthropic":
         return AnthropicModel(config, tools)
+    host = urlsplit(d["base_url"]).hostname
+    effort = d.get("effort")
     return ChatModel(
         OpenAI(api_key=config.api_key, base_url=d["base_url"], max_retries=0, timeout=d["request_timeout"]),
         name=d["model"], temperature=d["temperature"], top_p=d["top_p"], streaming=d["streaming"],
         max_attempts=d["max_retries"], retry_delay=d["retry_base_delay"], tools=tools, context_limit=d["context_limit"],
-        request_limit=d.get("request_limit"), disable_thinking=urlsplit(d["base_url"]).hostname == "api.deepseek.com",
+        request_limit=d.get("request_limit"), disable_thinking=host == "api.deepseek.com",
+        effort=effort if effort in effort_levels(d) else None,
+        stream_usage=host in {"api.openai.com", "api.deepseek.com"} or d.get("stream_usage") is True,
     )
 
 
@@ -78,13 +93,18 @@ class AnthropicModel:
                 raise ModelRequestBudgetError("已达到模型请求上限。")
             self.requests_sent += 1
             emit({"type": "model_request", "number": self.requests_sent, "attempt": attempt + 1})
+            usage = RequestUsage(emit)
             try:
                 with self.client.stream("POST", url, json=payload) as response:
+                    check_cancelled()
                     response.raise_for_status()
                     if not self.streaming:
                         raw = json.loads(response.read())
+                        snapshot = raw.get("usage") or {}
+                        usage.report(snapshot.get("input_tokens"), snapshot.get("output_tokens"))
                     else:
-                        raw = self._stream(response, emit)
+                        raw = self._stream(response, emit, usage)
+                check_cancelled()
                 break
             except (ValueError, AttributeError, KeyError, TypeError) as error:
                 raise ModelResponseError("Anthropic 响应格式无效。", reason="invalid_response") from error
@@ -104,15 +124,12 @@ class AnthropicModel:
                 text.append(block["text"])
             elif block["type"] == "tool_use":
                 calls.append({"id": block["id"], "type": "function", "function": {"name": block["name"], "arguments": json.dumps(block["input"])}})
-        usage = raw.get("usage", {})
-        inp, out = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
-        emit({"type": "usage", "input_tokens": inp, "output_tokens": out, "total_tokens": inp + out})
         if not self.streaming and text:
             emit({"type": "text_delta", "text": "\n".join(text)})
         return _checked_reply("\n".join(text) or None, calls,
                               "tool_calls" if reason == "tool_use" else "stop", allow_tools=allow_tools)
 
-    def _stream(self, response, emit):
+    def _stream(self, response, emit, usage):
         raw, blocks, fragments, stopped = {}, {}, {}, False
         for line in response.iter_lines():
             check_cancelled()
@@ -122,6 +139,8 @@ class AnthropicModel:
             kind = event["type"]
             if kind == "message_start":
                 raw = event["message"]
+                snapshot = raw.get("usage") or {}
+                usage.report(snapshot.get("input_tokens"), snapshot.get("output_tokens"))
             elif kind == "content_block_start":
                 index = event["index"]
                 blocks[index] = event["content_block"]
@@ -135,7 +154,8 @@ class AnthropicModel:
                     fragments[index] += delta["partial_json"]
             elif kind == "message_delta":
                 raw.update(event["delta"])
-                raw.setdefault("usage", {}).update(event.get("usage", {}))
+                snapshot = event.get("usage") or {}
+                usage.report(snapshot.get("input_tokens"), snapshot.get("output_tokens"))
             elif kind == "message_stop":
                 stopped = True
             elif kind == "error":

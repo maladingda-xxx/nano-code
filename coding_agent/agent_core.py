@@ -18,6 +18,7 @@ RequestModel = Callable[[list[dict], bool, EventHandler], "ModelReply"]
 class ModelReply:
     text: str | None = None
     tool_calls: list[dict] = field(default_factory=list)
+    reasoning_content: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -116,18 +117,19 @@ def run_turn(
                 reason = "model_fallback"
             if reply.tool_calls and not allow_tools:
                 raise ModelResponseError("当前请求未启用工具调用。", reason="invalid_tool_calls")
+            assistant = {"role": "assistant", "content": reply.text}
+            if reply.reasoning_content is not None:
+                assistant["reasoning_content"] = reply.reasoning_content
             if not reply.tool_calls:
                 if not reply.text or not reply.text.strip():
                     raise ModelResponseError("模型未返回有效文本。", reason="empty_response")
-                messages.append({"role": "assistant", "content": reply.text})
+                messages.append(assistant)
                 publish({"type": "reply", "text": reply.text}, durable=True)
                 break
 
             pending = list(reply.tool_calls)
             batch_index = len(messages)
-            batch = {
-                "role": "assistant", "content": reply.text, "tool_calls": pending.copy(),
-            }
+            batch = {**assistant, "tool_calls": pending.copy()}
             messages.append(batch)
             while pending:
                 check_cancelled()

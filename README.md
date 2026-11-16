@@ -3,13 +3,13 @@
 Nano Code 0.6 是一个本地终端编程助手。它使用你配置的模型，在项目中查找代码、编辑文件、运行获授权的验证命令，并保留可以恢复和撤销的会话记录。
 
 ```powershell
-py -3.11 -m pip install -e .\coding_agent
-nano-code setup
+python -m pip install -e .\coding_agent
+python -m nano_code --version
 nano-code doctor
 nano-code
 ```
 
-已有 `coding_agent/.env` 的用户可直接启动。首次配置时用环境变量或 `--env-file` 提供 API Key。Linux 和 macOS 可用 `python3 -m pip install -e ./coding_agent` 安装。
+请使用准备运行 Nano Code 的 Python 环境安装。使用 Conda 时，先激活目标环境，再运行上面的命令升级旧入口。已有 `coding_agent/.env` 的用户可直接启动。首次使用可运行 `nano-code setup`，再通过环境变量或 `--env-file` 提供 API Key。Linux 和 macOS 可用 `python3 -m pip install -e ./coding_agent` 安装。
 
 [快速上手与版本差异](docs/terminal.md) · [执行内核与旧入口](coding_agent/README.md) · [评测记录](evals/README.md)
 

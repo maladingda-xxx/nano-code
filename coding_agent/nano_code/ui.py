@@ -9,13 +9,14 @@ import time
 from collections import deque
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application import create_app_session, run_in_terminal
+from prompt_toolkit.application import create_app_session, run_in_terminal, set_app
 from prompt_toolkit.completion import Completer, Completion, PathCompleter
+from prompt_toolkit.filters import Condition, is_done
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import ConditionalContainer, FormattedTextControl, HSplit, Window
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
-from rich import box
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.rule import Rule
@@ -25,6 +26,8 @@ from rich.text import Text
 
 from context_budget import estimate_tokens
 from . import __version__
+from .mascot import mascot
+from .work_status import WorkStatus
 
 ACCENT = "#d68c6e"
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -36,6 +39,7 @@ COMMANDS = {
     "/undo": "撤销当前会话最近一次内置编辑", "/rewind": "列出文件检查点",
     "/checkpoints": "列出或预览检查点", "/restore": "恢复指定轮次的文件",
     "/recover": "查看或恢复异常退出的轮次", "/model": "查看或切换模型",
+    "/effort": "查看或切换受支持模型的推理强度",
     "/permissions": "查看或切换权限模式", "/plan": "切换只读计划模式",
     "/context": "查看上下文占用", "/compact": "生成摘要并保留原始存档",
     "/cost": "查看实际 token 用量", "/tasks": "查看任务列表", "/skills": "查看可用 Skills",
@@ -76,48 +80,49 @@ class Renderer:
         self.console = console or Console(highlight=False)
         self.expanded = False
         self.streaming = False
+        self.stream_tail = ""
         self.output = []
-        self.state = "ready"
         self.started = time.monotonic()
 
     def welcome(self, session):
-        left = Group(Text("◈  Nano Code", style=f"bold {ACCENT}"),
-                     Text(f"v{__version__} · local coding workspace", style="dim"), Text(""),
-                     Text("把想做的事交给终端。", style="bold"),
-                     Text(safe_text(session.config.data["model"])),
-                     Text(safe_text(str(session.root)), style="dim", overflow="fold"))
-        right = Group(Text("开始工作", style=f"bold {ACCENT}"),
-                      Text("描述任务，或输入 / 查看命令"), Text("@ 引用文件 · /diff 审阅修改"), Text(""),
-                      Text("最近会话", style=f"bold {ACCENT}"),
-                      Text("/resume 继续上次工作"), Text("/doctor 检查配置", style="dim"))
-        grid = Table.grid(expand=True, padding=(0, 3))
-        grid.add_column(ratio=3)
-        if self.console.width >= 85:
-            grid.add_column(ratio=2)
-            grid.add_row(left, right)
+        title = Text.assemble(("Nano Code", "bold"), (f" v{__version__}", "dim"))
+        details = Group(
+            title,
+            Text(safe_text(session.config.data["model"]), style="dim", overflow="fold"),
+            Text(safe_text(str(session.root)), style="dim", overflow="fold"),
+        )
+        art = mascot(color=self.console.color_system is not None and not self.console.no_color)
+        self.console.print()
+        if self.console.width < 30:
+            self.console.print(Group(art, details))
         else:
-            grid.add_row(left)
-        self.console.print(Panel(grid, border_style=ACCENT, box=box.ROUNDED, padding=(1, 2), title="[dim]NANO / TERMINAL[/dim]", title_align="left"))
-        self.console.print(Text("  Enter 发送 · Alt+Enter 换行 · Shift+Tab 切换模式 · Ctrl+C 取消 · Ctrl+O 展开", style="dim"))
+            banner = Table.grid(padding=(0, 2), expand=True)
+            banner.add_column(no_wrap=True)
+            banner.add_column(ratio=1, vertical="middle")
+            banner.add_row(art, details)
+            self.console.print(banner)
+        self.console.print(Text("/help 命令 · Alt+Enter 换行 · Ctrl+C 取消", style="dim"))
         self.console.print()
 
     def event(self, event):
         kind = event["type"]
-        if kind == "text_delta":
+        if kind in {"text_delta", "tool_output"}:
+            if kind == "tool_output" and not self.expanded:
+                return
             if not self.streaming:
-                self.console.print(Text("● ", style=ACCENT), end="")
-            self.console.print(Text(safe_text(event["text"])), end="", soft_wrap=True)
+                self.stream_tail = "● " if kind == "text_delta" else ""
+            complete, newline, self.stream_tail = (self.stream_tail + safe_text(event["text"])).rpartition("\n")
+            if newline:
+                self.console.print(Text(complete), soft_wrap=True)
             self.streaming = True
-            self.state = "responding"
             return
-        if self.streaming:
-            self.console.print()
-            self.streaming = False
+        if kind in {"model_request", "usage", "subagent_event"}:
+            return
+        if kind == "reply" and not self.streaming:
+            self.console.print(Text("● " + safe_text(event["text"])))
+        self.finish_stream()
         if kind == "turn_start":
-            self.started = time.monotonic()
             self.output = []
-        elif kind == "model_start":
-            self.state = "thinking"
         elif kind == "tool_request":
             f = event["call"]["function"]
             try:
@@ -126,7 +131,6 @@ class Renderer:
             except ValueError:
                 detail = ""
             self.console.print(Text(f"● {f['name']}  {safe_text(detail)[:180]}", style=ACCENT))
-            self.state = f["name"]
         elif kind == "tool_result":
             self.output.append(event)
             content = safe_text(event["result"])
@@ -138,41 +142,53 @@ class Renderer:
                 self.console.print(Text("  ⎿  " + (lines[0][:160] if lines else status), style="dim" if status == "ok" else "yellow"))
                 if len(lines) > 1:
                     self.console.print(Text(f"     +{len(lines)-1} lines · /output 展开", style="dim"))
-        elif kind == "tool_output" and self.expanded:
-            self.console.print(Text(safe_text(event["text"])), end="", soft_wrap=True)
         elif kind in {"error", "notice", "recovery_error"}:
             self.console.print(Text("  " + safe_text(event["text"]), style="yellow" if kind == "notice" else "red"))
         elif kind == "subagent_start":
             self.console.print(Text(f"● {event['agent']}  ·  read-only subagent", style=ACCENT))
         elif kind == "turn_end":
-            self.state = "ready"
             state = event["verification"]["status"]
             label = {"passed": "验证通过", "failed": "验证失败", "not_run": "未运行验证", "stale": "修改后需要重新验证", "inconclusive": "验证结果不确定"}.get(state, state)
             files = len(event.get("changes", {}).get("files", []))
             self.console.print(Text(f"  {event['status']} · {time.monotonic()-self.started:.1f}s · {files} 个文件 · {label}", style="green" if state == "passed" else "dim"))
             self.console.print()
 
-    def show_output(self):
+    def finish_stream(self):
+        if self.stream_tail:
+            self.console.print(Text(self.stream_tail), soft_wrap=True)
+        self.stream_tail = ""
+        self.streaming = False
+
+    def show_output(self, console=None):
+        console = self.console if console is None else console
         for event in self.output:
             name = event["call"]["function"]["name"]
-            self.console.print(Rule(name, style=ACCENT))
+            console.print(Rule(name, style=ACCENT))
             text = safe_text(event["result"])
-            self.console.print(Syntax(text, "diff", theme="ansi_dark", word_wrap=True) if name == "edit_file" else Text(text))
+            console.print(Syntax(text, "diff", theme="ansi_dark", word_wrap=True) if name == "edit_file" else Text(text))
         if not self.output:
-            self.console.print("暂无工具输出。")
+            console.print("暂无工具输出。")
 
 
 async def interactive(session, initial=None, *, terminal_input=None, terminal_output=None):
     from .commands import execute_command
 
-    renderer = Renderer()
+    renderer = Renderer(Console(file=sys.stdout, highlight=False))
     renderer.welcome(session)
+    work = WorkStatus()
     events = asyncio.Queue()
     prompts = asyncio.Queue()
     pending = deque()
     loop = asyncio.get_running_loop()
     closing = False
     command_running = False
+
+    def enqueue(text):
+        prompts.put_nowait((text, time.monotonic()))
+
+    def cancel_work():
+        session.cancel()
+        work.cancel()
 
     def emit(event):
         loop.call_soon_threadsafe(events.put_nowait, event)
@@ -230,16 +246,19 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     @bindings.add("c-c")
     def interrupt(event):
-        if session.busy:
-            session.cancel()
+        if work.active or session.busy or pending:
+            cancel_work()
+            event.app.invalidate()
+            return
         event.current_buffer.reset()
         event.app.exit(exception=KeyboardInterrupt())
 
     def toolbar():
         mode = session.permissions.mode
-        state = "等待授权 / 回答" if pending else renderer.state
+        if prompt.app.output.get_size().columns < 58:
+            return [("class:toolbar", f" {mode} · queue {prompts.qsize()} ")]
         context = estimate_tokens(session.messages)
-        return [("class:toolbar", f" {mode}  │  {state}  │  {session.uid[:8]}  │  ~{context:,}/{session.config.data['context_limit']:,} tokens  │  queue {prompts.qsize()} ")]
+        return [("class:toolbar", f" {mode}  │  {session.uid[:8]}  │  ~{context:,}/{session.config.data['context_limit']:,} tokens  │  queue {prompts.qsize()} ")]
 
     try:
         session.config.home.mkdir(parents=True, exist_ok=True)
@@ -250,6 +269,8 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
         light = session.config.data["theme"] == "light"
         return Style.from_dict({"prompt": "#a84d37 bold" if light else "#d68c6e bold",
             "toolbar": "bg:#f3e9e2 #403128" if light else "bg:#262626 #bdbdbd",
+            "work.label": "#a84d37 bold" if light else "#f1a56c bold",
+            "work.note": "#f3ad58", "work.detail": "#736059" if light else "#b5a9a0",
             "completion-menu.completion.current": "bg:#d68c6e #161616"})
 
     from prompt_toolkit.styles import DynamicStyle
@@ -262,6 +283,33 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
         reserve_space_for_menu=3,
         input=terminal_input, output=terminal_output,
     )
+
+    def pending_request():
+        return next((item for item in pending if not item["future"].done()), None)
+
+    def status_fragments():
+        waiting = pending_request()
+        hint = None
+        if waiting and not work.cancelling:
+            hint = "等待授权 · y 允许 / s 本会话 / n 拒绝" if waiting["type"] == "approval" else "等待你的回答"
+        return work.fragments(prompt.app.output.get_size().columns,
+                              color=not renderer.console.no_color, waiting=hint)
+
+    prompt.app.layout.container = HSplit([
+        ConditionalContainer(
+            Window(FormattedTextControl(lambda: renderer.stream_tail), wrap_lines=True,
+                   dont_extend_height=True), filter=~is_done & Condition(lambda: bool(renderer.stream_tail)),
+        ),
+        ConditionalContainer(
+            Window(FormattedTextControl(status_fragments), height=1, wrap_lines=False),
+            filter=~is_done & Condition(lambda: work.active or pending_request() is not None),
+        ),
+        prompt.app.layout.container,
+    ])
+
+    async def print_above(callback):
+        with set_app(prompt.app):
+            await run_in_terminal(callback)
 
     async def consume_events():
         while True:
@@ -284,33 +332,48 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                             renderer.console.print(Text(safe_text(event["text"]), style="bold"))
                             for index, option in enumerate(event.get("options") or [], 1):
                                 renderer.console.print(Text(f"  {index}. {safe_text(option)}"))
-                    await run_in_terminal(display)
+                    await print_above(display)
                 else:
-                    await run_in_terminal(lambda: renderer.event(event))
+                    work.event(event)
+                    kind = event["type"]
+                    if kind in {"text_delta", "tool_output"} and "\n" not in event["text"]:
+                        renderer.event(event)
+                    elif kind not in {"model_request", "usage", "subagent_event"}:
+                        await print_above(lambda: renderer.event(event))
             except Exception as error:
                 if event.get("future") and not event["future"].done():
                     event["future"].set_result(False if event["type"] == "approval" else "无法展示问题。")
                 renderer.console.print(Text(str(error), style="red"))
             finally:
                 events.task_done()
+                prompt.app.invalidate()
 
     async def run_prompts():
         while True:
-            text = await prompts.get()
+            text, submitted = await prompts.get()
+            work.start(submitted)
+            renderer.started = submitted
+            prompt.app.invalidate()
             try:
-                await run_in_terminal(lambda: renderer.console.print(Text("❯ " + safe_text(text), style="bold")))
+                await print_above(lambda: renderer.console.print(Text("❯ " + safe_text(text), style="bold")))
+                if work.cancelling:
+                    continue
                 from .commands import expand_references
                 await asyncio.to_thread(lambda: session.run(expand_references(session, text)))
             except (Exception, KeyboardInterrupt) as error:
-                await run_in_terminal(lambda error=error: renderer.console.print(Text(str(error) or "已取消。", style="red")))
+                await print_above(lambda error=error: renderer.console.print(Text(str(error) or "已取消。", style="red")))
             finally:
-                renderer.state = "ready"
+                await events.join()
+                work.stop()
+                if renderer.streaming:
+                    await print_above(renderer.finish_stream)
+                prompt.app.invalidate()
                 prompts.task_done()
 
     consumer = asyncio.create_task(consume_events())
     worker = asyncio.create_task(run_prompts())
     if initial:
-        prompts.put_nowait(initial)
+        enqueue(initial)
     try:
         with create_app_session(input=terminal_input, output=terminal_output), patch_stdout(raw=True):
             while not closing:
@@ -330,6 +393,9 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                     pending.popleft()
                 if not text:
                     continue
+                if text == "/cancel":
+                    cancel_work()
+                    continue
                 if pending:
                     item = pending[0]
                     if item["type"] == "approval":
@@ -345,9 +411,6 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                 if text in {"/exit", "/quit"}:
                     closing = True
                     break
-                if text == "/cancel":
-                    session.cancel()
-                    continue
                 if text == "/queue":
                     renderer.console.print(f"待执行消息：{prompts.qsize()}。/clear-queue 清除待执行消息。")
                     continue
@@ -366,9 +429,10 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                             nonlocal command_running
                             command_running = True
                             try:
-                                reply = await asyncio.to_thread(execute_command, session, command, renderer)
+                                reply = await asyncio.to_thread(execute_command, session, command, renderer,
+                                                                console=Console(highlight=False))
                                 if isinstance(reply, str) and reply:
-                                    prompts.put_nowait(reply)
+                                    enqueue(reply)
                             except (Exception, KeyboardInterrupt) as error:
                                 renderer.console.print(Text(str(error) or "已取消。", style="red"))
                             finally:
@@ -381,9 +445,9 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                     if command_running:
                         renderer.console.print("命令处理中，请稍候。")
                         continue
-                    prompts.put_nowait(text)
+                    enqueue(text)
     finally:
-        session.cancel()
+        cancel_work()
         while not prompts.empty():
             prompts.get_nowait()
             prompts.task_done()

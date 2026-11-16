@@ -100,7 +100,9 @@ def export_session(uid, messages, path):
     if path.exists():
         raise ValueError("导出文件已存在，请使用新文件名。")
     if path.suffix == ".json":
-        text = json.dumps({"schema_version": 1, "session_id": uid, "messages": messages}, ensure_ascii=False, indent=2)
+        public_messages = [{key: value for key, value in message.items() if key != "reasoning_content"}
+                           for message in messages]
+        text = json.dumps({"schema_version": 1, "session_id": uid, "messages": public_messages}, ensure_ascii=False, indent=2)
     else:
         text = f"# Nano Code session {uid}\n\n" + "\n\n".join(
             f"## {m['role']}\n\n{m.get('content') or ''}" for m in messages if m["role"] != "system")

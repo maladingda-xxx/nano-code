@@ -187,18 +187,18 @@ def detect_project(root: Path) -> str:
     try:
         git_dir = sp.run(
             ["git", "rev-parse", "--git-dir"],
-            capture_output=True, text=True, timeout=5, cwd=root
+            capture_output=True, encoding="utf-8", errors="replace", timeout=5, cwd=root
         )
         if git_dir.returncode == 0:
             branch = sp.run(
                 ["git", "branch", "--show-current"],
-                capture_output=True, text=True, timeout=5, cwd=root
+                capture_output=True, encoding="utf-8", errors="replace", timeout=5, cwd=root
             )
             branch_name = branch.stdout.strip() or "unknown"
 
             log = sp.run(
                 ["git", "log", "--oneline", "-3", "--format=%s"],
-                capture_output=True, text=True, timeout=5, cwd=root
+                capture_output=True, encoding="utf-8", errors="replace", timeout=5, cwd=root
             )
             commits = [c.strip() for c in log.stdout.strip().split("\n") if c.strip()]
 

@@ -419,11 +419,26 @@ def run_command(
     if Path(executable).parent != Path(".") or "/" in executable or chr(92) in executable:
         executable = str(workspace_path(_workspace_root, str(directory / executable), tool))
     elif program in {"python", "python3"} and "." not in executable:
+        # Prefer the target project's interpreter, not Nano Code's own environment.
         executable = sys.executable
+        for parent in (directory, *directory.parents):
+            if not parent.is_relative_to(_workspace_root):
+                break
+            candidate = parent / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            if candidate.is_file():
+                executable = str(candidate)
+                break
     else:
         executable = shutil.which(executable) or executable
     if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
-        raise ToolSecurityError("Windows 下请直接调用可执行程序，例如 python -m pytest。", tool_name=tool)
+        # npm's official shim can be invoked directly through Node, without cmd.exe.
+        entry = Path(executable).parent / "node_modules/npm/bin" / f"{program}-cli.js"
+        node = shutil.which("node")
+        if program in {"npm", "npx"} and node and entry.is_file():
+            if confirm is None or not confirm(argv, directory):
+                return ToolResult("命令未获授权，未执行。", status="denied")
+            return run_process([node, str(entry), *argv[1:]], directory, timeout, on_output)
+        raise ToolSecurityError("Windows 下请直接调用可执行程序，例如 python -m pytest 或 node script.js。", tool_name=tool)
     if confirm is None or not confirm(argv, directory):
         return ToolResult("命令未获授权，未执行。", status="denied")
 

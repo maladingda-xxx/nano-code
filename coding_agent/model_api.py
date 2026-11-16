@@ -8,6 +8,7 @@ from openai import APIConnectionError, APIStatusError, OpenAI
 
 from agent_core import EventHandler, ModelReply
 from context_budget import fit_request
+from cancellation import check_cancelled
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 
 TOOL_MARKUP_MARKERS = ("<｜｜DSML｜｜", "<|tool_call|>", "<tool_calls>")
@@ -100,6 +101,7 @@ class ChatModel:
         if self.disable_thinking:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         for attempt in range(1, self.max_attempts + 1):
+            check_cancelled()
             if self.request_limit is not None and self.requests_sent >= self.request_limit:
                 raise ModelRequestBudgetError(f"已达到模型请求上限（{self.request_limit} 次）。")
             self.requests_sent += 1
@@ -116,9 +118,12 @@ class ChatModel:
                     raise ModelRequestBudgetError(
                         f"请求失败且已达到模型请求上限（{self.request_limit} 次）。"
                     ) from error
-                delay = self.retry_delay * 2 ** (attempt - 1) + random.uniform(0, 1)
+                delay = min(30, self.retry_delay * 2 ** min(attempt - 1, 8) + random.uniform(0, 1))
                 emit({"type": "notice", "text": f"模型请求失败，{delay:.1f} 秒后重试。"})
-                time.sleep(delay)
+                while delay > 0:
+                    check_cancelled()
+                    time.sleep(min(delay, 0.1))
+                    delay -= 0.1
         raise AgentAPIError("模型请求次数必须大于零。")
 
     def summarize(self, messages: list[dict], emit: EventHandler) -> str:
@@ -156,6 +161,7 @@ class ChatModel:
         with stream:
             chunks = iter(stream)
             while True:
+                check_cancelled()
                 try:
                     chunk = next(chunks)
                 except StopIteration:

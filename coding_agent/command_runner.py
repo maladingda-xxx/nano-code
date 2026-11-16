@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from agent_core import ToolResult
+from cancellation import check_cancelled
 
 
 @contextmanager
@@ -114,6 +115,7 @@ def run_process(
             with _start_process(argv, cwd, stdin, *writers) as poll:
                 deadline = time.monotonic() + timeout
                 while (exit_code := poll()) is None:
+                    check_cancelled()
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         status = "timeout"

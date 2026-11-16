@@ -229,3 +229,6 @@ __marimo__/
 # Coding Agent session database
 *.coding_agent_sessions.db
 *.db-journal
+*.coding_agent_sessions.db-wal
+*.coding_agent_sessions.db-shm
+.nano/settings.local.json

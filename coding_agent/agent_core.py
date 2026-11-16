@@ -7,6 +7,7 @@ from time import perf_counter
 from uuid import uuid4
 
 from edit_context import edit_scope
+from cancellation import check_cancelled
 from exceptions import AgentAPIError, ModelResponseError, TurnPersistenceError
 
 EventHandler = Callable[[dict], None]
@@ -75,6 +76,7 @@ def run_turn(
         elif prepare:
             messages[:] = prepare(messages)
         for round_number in range(max_tool_rounds + 1):
+            check_cancelled()
             allow_tools = round_number < max_tool_rounds
             request_messages = messages
             if not allow_tools:
@@ -128,6 +130,7 @@ def run_turn(
             }
             messages.append(batch)
             while pending:
+                check_cancelled()
                 call = pending[0]
                 tool_calls_made += 1
                 tool_scope = {"call": call, "tool_call_id": call["id"], "round": round_number + 1}

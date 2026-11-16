@@ -43,18 +43,19 @@ def workspace_path(root: Path, value: str, tool: str) -> Path:
 
 
 def read_project_instructions(root: Path, directory: Path) -> str:
-    """Load AGENTS.md from the repository root through the launch directory."""
+    """Load project instructions from the repository root through a directory."""
     relative = directory.resolve().relative_to(root)
     instructions = []
     for depth in range(len(relative.parts) + 1):
-        name = Path(*relative.parts[:depth]) / "AGENTS.md"
-        try:
-            path = workspace_path(root, str(name), "AGENTS.md")
-            with path.open(encoding="utf-8-sig") as stream:
-                content = stream.read(16001)
-        except (OSError, UnicodeError, ToolSecurityError):
-            continue
-        if len(content) > 16000:
-            content = content[:16000] + "\n（文件过长，已截断）"
-        instructions.append(f"### {name.as_posix()}\n{content}")
+        for filename in ("CLAUDE.md", "AGENTS.md"):
+            name = Path(*relative.parts[:depth]) / filename
+            try:
+                path = workspace_path(root, str(name), filename)
+                with path.open(encoding="utf-8-sig") as stream:
+                    content = stream.read(16001)
+            except (OSError, UnicodeError, ToolSecurityError):
+                continue
+            if len(content) > 16000:
+                content = content[:16000] + "\n（文件过长，已截断）"
+            instructions.append(f"### {name.as_posix()}\n{content}")
     return "\n\n".join(instructions)

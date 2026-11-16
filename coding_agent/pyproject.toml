@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 nano-code = "nano_code.cli:main"
+nano = "nano_code.cli:main"
 coding-agent = "nano_code.cli:main"
 nano-code-legacy = "agent:main"
 

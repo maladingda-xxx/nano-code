@@ -14,7 +14,7 @@ $env:API_KEY = '<你的模型 API Key>'
 nano-code doctor
 ```
 
-`setup` 保存 API 类型、地址和模型 ID。默认使用 DeepSeek 的 OpenAI 兼容接口。接入其他兼容服务时设置对应的 Base URL 和模型 ID。使用 Anthropic Messages API 时选择 `anthropic`，并设置 `ANTHROPIC_API_KEY` 或 `API_KEY`。如果 `nano-code` 不在 PATH，可以用安装时的同一个 `python` 运行 `python -m nano_code`。
+安装后 `nano` 与 `nano-code` 等价，可直接用 `nano` 启动；如果系统中已有 GNU nano 等同名命令，优先使用 `nano-code`。`setup` 保存 API 类型、地址和模型 ID。默认使用 DeepSeek 的 OpenAI 兼容接口。接入其他兼容服务时设置对应的 Base URL 和模型 ID。使用 Anthropic Messages API 时选择 `anthropic`，并设置 `ANTHROPIC_API_KEY` 或 `API_KEY`。如果 `nano-code` 不在 PATH，可以用安装时的同一个 `python` 运行 `python -m nano_code`。
 
 如果 Windows 上的 `nano-code.exe` 仍从 `agent` 导入，或报找不到 `cancellation`，通常是旧的 0.3 可编辑安装仍然生效。用 `(Get-Command nano-code).Source` 检查启动器所在目录，在对应环境中执行 `python -m pip install -e .\coding_agent`，再执行 `nano-code --version`。例如启动器在 `D:\miniconda3\Scripts` 时，从 Conda `base` 环境安装，或明确使用 `& 'D:\miniconda3\python.exe' -m pip install -e .\coding_agent`。可编辑安装会继续读取仓库里的 `coding_agent/.env`。
 

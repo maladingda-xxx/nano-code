@@ -25,11 +25,16 @@ def parse_argv(raw):
     return value
 
 
+def _program_name():
+    name = Path(sys.argv[0]).stem
+    return name if name in {"nano", "nano-code", "coding-agent"} else "nano-code"
+
+
 def main(argv=None):
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(prog="nano-code", description="Nano Code · terminal coding assistant")
+    parser = argparse.ArgumentParser(prog=_program_name(), description="Nano Code · terminal coding assistant")
     parser.add_argument("prompt", nargs="?")
     parser.add_argument("-p", "--print", dest="print_prompt", metavar="PROMPT")
     parser.add_argument("--json", action="store_true", help="alias for --output-format stream-json")

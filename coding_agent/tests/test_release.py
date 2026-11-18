@@ -478,6 +478,15 @@ def test_terminal_accepts_prompt_approval_and_exit(project):
     asyncio.run(exercise())
 
 
+def test_mode_change_can_be_forced_while_busy(project):
+    with Session(project) as session:
+        session.busy = True
+        with pytest.raises(ValueError, match="运行中"):
+            session.set_permission_mode("plan")
+        session.set_permission_mode("plan", allow_busy=True)
+        assert session.permissions.mode == "plan"
+
+
 def test_terminal_cycles_permission_modes(project):
     async def exercise():
         with create_pipe_input() as pipe, Session(project) as session:

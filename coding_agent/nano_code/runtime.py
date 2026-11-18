@@ -136,8 +136,8 @@ class Session:
             self.model = create_model(self.config, self.tool_schemas)
         return self.model
 
-    def set_permission_mode(self, mode):
-        if self.busy:
+    def set_permission_mode(self, mode, *, allow_busy=False):
+        if self.busy and not allow_busy:
             raise ValueError("运行中不能切换权限模式。")
         if mode not in MODES:
             raise ValueError("可用模式：" + ", ".join(MODES))

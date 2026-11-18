@@ -15,6 +15,25 @@ def text(fragments):
     return "".join(fragment[1] for fragment in fragments)
 
 
+def test_completion_menu_has_top_and_bottom_rules():
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input import DummyInput
+    from prompt_toolkit.layout import FloatContainer, HSplit
+    from prompt_toolkit.output import DummyOutput
+    from nano_code.ui import BorderedCompletionsMenu, install_bordered_completion_menu
+
+    prompt = PromptSession(input=DummyInput(), output=DummyOutput())
+    install_bordered_completion_menu(prompt)
+    menus = {id(item.content): item.content for container in prompt.app.layout.walk()
+             if isinstance(container, FloatContainer)
+             for item in container.floats
+             if isinstance(item.content, BorderedCompletionsMenu)}
+    assert len(menus) == 1
+    menu = next(iter(menus.values()))
+    assert isinstance(menu.content, HSplit)
+    assert len(menu.content.children) == 3
+
+
 def test_status_keeps_fixed_art_width_and_shows_latest_turn_metrics():
     work = WorkStatus()
     work.start(100)

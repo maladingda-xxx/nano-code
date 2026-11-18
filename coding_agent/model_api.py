@@ -7,7 +7,7 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from agent_core import EventHandler, ModelReply
-from context_budget import fit_request
+from context_budget import DEFAULT_MAX_OUTPUT, fit_request
 from cancellation import check_cancelled
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 
@@ -198,7 +198,7 @@ class ChatModel:
         kwargs = {"tools": self.tools, "tool_choice": "auto"} if allow_tools else {}
         response = self._create(
             emit, messages=messages, temperature=self.temperature, top_p=self.top_p,
-            max_tokens=4096, stream=streaming, **kwargs,
+            max_tokens=DEFAULT_MAX_OUTPUT, stream=streaming, **kwargs,
         )
         if streaming:
             return self._stream_reply(response, emit)

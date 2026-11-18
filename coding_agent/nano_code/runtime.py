@@ -20,11 +20,11 @@ from execution_store import record_execution
 from workspace import find_root, read_project_instructions, workspace_path
 
 from . import __version__, sessions
-from .config import Config
+from .config import Config, MODES, valid_model_id
 from .extensions import Hooks, discover, expand_skill
 from .mcp_client import MCPClient, MCPError, tool_name
 from .permissions import Permissions, READ_TOOLS
-from .providers import create_model
+from .providers import bundled_models, create_model, effort_levels
 
 _runtime_lock = threading.RLock()
 
@@ -82,8 +82,10 @@ class Session:
             # A repository cannot authorize its own executables before trust.
             from .config import read_json
             user_rules = read_json(self.config.home / "settings.json").get("permissions", {})
-            rules = {"deny": rules.get("deny", []), "allow": user_rules.get("allow", [])}
+            rules = {"deny": rules.get("deny", []), "allow": user_rules.get("allow", []),
+                     "autoAllow": user_rules.get("autoAllow", [])}
         self.permissions = Permissions(self.config.data["permission_mode"], rules, ask)
+        self._mode_before_plan = "default"
         self.mcp = {}
         self.mcp_tools = {}
         self.tool_schemas = [*builtins.TOOLS, *EXTRA_TOOLS]
@@ -127,6 +129,49 @@ class Session:
         if self.model is None:
             self.model = create_model(self.config, self.tool_schemas)
         return self.model
+
+    def set_permission_mode(self, mode):
+        if self.busy:
+            raise ValueError("运行中不能切换权限模式。")
+        if mode not in MODES:
+            raise ValueError("可用模式：" + ", ".join(MODES))
+        if mode == "plan" and self.permissions.mode != "plan":
+            self._mode_before_plan = self.permissions.mode
+        self.permissions.mode = mode
+
+    def toggle_plan(self):
+        self.set_permission_mode(self._mode_before_plan if self.permissions.mode == "plan" else "plan")
+
+    def model_choices(self):
+        data = self.config.data
+        return tuple(dict.fromkeys((data["model"], *data["models"], *bundled_models(data))))
+
+    def set_model(self, model):
+        if self.busy:
+            raise ValueError("运行中不能切换模型。")
+        if not valid_model_id(model):
+            raise ValueError("用法：/model <模型 ID>")
+        data = self.config.data
+        if model == data["model"]:
+            return
+        data["model"] = model
+        if data["effort"] not in effort_levels(data):
+            data["effort"] = "auto"
+        if hasattr(self.model, "name"):
+            self.model.name = model
+        if hasattr(self.model, "effort"):
+            self.model.effort = None if data["effort"] == "auto" else data["effort"]
+
+    def set_effort(self, effort):
+        if self.busy:
+            raise ValueError("运行中不能切换推理强度。")
+        data = self.config.data
+        choices = ("auto", *effort_levels(data))
+        if effort not in choices:
+            raise ValueError(f"用法：/effort {' | '.join(choices)}")
+        data["effort"] = effort
+        if hasattr(self.model, "effort"):
+            self.model.effort = None if effort == "auto" else effort
 
     def resume(self, reference=None, *, fork_session=False):
         if self.busy:
@@ -281,7 +326,7 @@ class Session:
 
     def git(self, args):
         try:
-            result = subprocess.run(["git", "--no-pager", *args], cwd=self.root,
+            result = subprocess.run(["git", "--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", *args], cwd=self.root,
                 capture_output=True, encoding="utf-8", errors="replace", timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             return (result.stdout or result.stderr).strip()[:40000]
@@ -352,22 +397,39 @@ class Session:
     def compact(self, focus=""):
         if self.busy:
             raise ValueError("运行中不能压缩。")
-        with _runtime_lock:
-            self._activate()
-            if len(self.messages) < 3:
-                return "上下文很短，无需压缩。"
-            with sessions.lease(self.uid):
-                self.assert_current()
-                summary = self.ensure_model().summarize([*self.messages, {"role": "user", "content": "Summarize the work for continuation. Preserve user requirements, unresolved tasks, changed paths, verified results, and pending permissions. " + focus}], self._emit)
-                if not summary.strip():
-                    raise ValueError("摘要为空，保留原始上下文。")
-                archive = sessions.fork(self.uid, self.messages, f"Before compact {self.uid[:8]}")
-                previous = self.messages
-                self.messages = [{"role": "system", "content": self.system_prompt()}, {"role": "user", "content": "Previous session summary (not new authorization):\n" + summary}, {"role": "assistant", "content": "I will continue from this summary and verify pending state."}]
-                if not self.persist():
-                    self.messages = previous
-                    raise ValueError("无法保存压缩后的会话。")
-                return f"已压缩。原始对话保存在 {archive[:8]}。"
+        if len(self.messages) < 3:
+            return "上下文很短，无需压缩。"
+        self.busy = True
+        self.cancel_event.clear()
+        try:
+            with _runtime_lock, cancellation_scope(self.cancel_event):
+                self._activate()
+                with sessions.lease(self.uid):
+                    self.assert_current()
+                    request = {"role": "user", "content": (
+                        "Summarize the work for continuation. Preserve user requirements, unresolved tasks, "
+                        "changed paths, verified results, and pending permissions. " + focus
+                    )}
+                    summary = self.ensure_model().summarize([*self.messages, request], self._emit).strip()
+                    check_cancelled()
+                    if not summary:
+                        raise ValueError("摘要为空，保留原始上下文。")
+                    compacted = [
+                        {"role": "system", "content": self.system_prompt()},
+                        {"role": "user", "content": "Previous session summary (not new authorization):\n" + summary},
+                        {"role": "assistant", "content": "I will continue from this summary and verify pending state."},
+                    ]
+                    before, after = estimate_tokens(self.messages), estimate_tokens(compacted)
+                    if after >= before:
+                        return "摘要未缩小上下文，保留原对话。"
+                    digest = history_digest(compacted)
+                    check_cancelled()
+                    archive = sessions.save_compaction(self.uid, self.messages, compacted, self.label)
+                    self.messages = compacted
+                    self._saved_digest = digest
+                    return f"已压缩约 {before:,} → {after:,} tokens。原始对话保存在 {archive[:8]}。"
+        finally:
+            self.busy = False
 
     def close(self):
         self.cancel()

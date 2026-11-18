@@ -26,7 +26,9 @@ from rich.text import Text
 
 from context_budget import estimate_tokens
 from . import __version__
+from .config import MODES, MODE_CYCLE
 from .mascot import mascot
+from .providers import effort_levels
 from .work_status import WorkStatus
 
 ACCENT = "#d68c6e"
@@ -40,7 +42,7 @@ COMMANDS = {
     "/checkpoints": "列出或预览检查点", "/restore": "恢复指定轮次的文件",
     "/recover": "查看或恢复异常退出的轮次", "/model": "查看或切换模型",
     "/effort": "查看或切换受支持模型的推理强度",
-    "/permissions": "查看或切换权限模式", "/plan": "切换只读计划模式",
+    "/permissions": "查看或切换权限模式", "/plan": "切换只读计划模式", "/auto": "切换自动模式",
     "/context": "查看上下文占用", "/compact": "生成摘要并保留原始存档",
     "/cost": "查看实际 token 用量", "/tasks": "查看任务列表", "/skills": "查看可用 Skills",
     "/agents": "查看只读子代理", "/mcp": "查看、连接、断开 MCP", "/hooks": "查看已启用 hooks",
@@ -57,17 +59,29 @@ def safe_text(value):
 
 
 class InputCompleter(Completer):
-    def __init__(self, root, skills):
-        self.root, self.skills = root, skills
-        self.paths = PathCompleter(get_paths=lambda: [str(root)], expanduser=False)
+    def __init__(self, session):
+        self.session = session
+        self.paths = PathCompleter(get_paths=lambda: [str(session.root)], expanduser=False)
 
     def get_completions(self, document, complete_event):
         before = document.text_before_cursor
         if before.startswith("/") and " " not in before:
-            for name, detail in {**COMMANDS, **{"/" + s.name: s.description for s in self.skills.values()}}.items():
+            for name, detail in {**COMMANDS, **{"/" + s.name: s.description for s in self.session.skills.values()}}.items():
                 if name.startswith(before):
                     yield Completion(name, start_position=-len(before), display_meta=detail)
         else:
+            command, _, argument = before.partition(" ")
+            if command in {"/model", "/effort", "/permissions"}:
+                prefix = argument.lstrip()
+                choices = {
+                    "/model": self.session.model_choices(),
+                    "/effort": ("auto", *effort_levels(self.session.config.data)),
+                    "/permissions": MODES,
+                }[command]
+                for choice in choices:
+                    if choice.startswith(prefix):
+                        yield Completion(choice, start_position=-len(prefix))
+                return
             word = document.get_word_before_cursor(WORD=True)
             if word.startswith("@"):
                 from prompt_toolkit.document import Document
@@ -234,11 +248,11 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     @bindings.add("s-tab")
     def change_mode(event):
-        if session.busy:
+        if session.busy or work.active or command_running or not prompts.empty():
             return
-        choices = ["default", "acceptEdits", "plan"]
         current = session.permissions.mode
-        session.permissions.mode = choices[(choices.index(current) + 1) % len(choices)] if current in choices else "default"
+        following = (MODE_CYCLE.index(current) + 1) % len(MODE_CYCLE) if current in MODE_CYCLE else 0
+        session.set_permission_mode(MODE_CYCLE[following])
 
     @bindings.add("c-o")
     def expand(event):
@@ -246,7 +260,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     @bindings.add("c-c")
     def interrupt(event):
-        if work.active or session.busy or pending:
+        if work.active or session.busy or command_running or pending:
             cancel_work()
             event.app.invalidate()
             return
@@ -275,7 +289,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     from prompt_toolkit.styles import DynamicStyle
     prompt = PromptSession(
-        history=history, completer=InputCompleter(session.root, session.skills),
+        history=history, completer=InputCompleter(session),
         complete_while_typing=True, key_bindings=bindings, multiline=True,
         prompt_continuation="  ", bottom_toolbar=toolbar,
         style=DynamicStyle(theme),
@@ -425,19 +439,19 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                         if command_running:
                             renderer.console.print("上一条命令仍在执行。")
                             continue
-                        async def run_command(command):
+                        async def run_command(command, running):
                             nonlocal command_running
                             command_running = True
                             try:
                                 reply = await asyncio.to_thread(execute_command, session, command, renderer,
-                                                                console=Console(highlight=False))
+                                                                console=Console(highlight=False), running=running)
                                 if isinstance(reply, str) and reply:
                                     enqueue(reply)
                             except (Exception, KeyboardInterrupt) as error:
                                 renderer.console.print(Text(str(error) or "已取消。", style="red"))
                             finally:
                                 command_running = False
-                        command_task = asyncio.create_task(run_command(text))
+                        command_task = asyncio.create_task(run_command(text, work.active or not prompts.empty()))
                         await asyncio.sleep(0)
                     except Exception as error:
                         renderer.console.print(Text(str(error), style="red"))

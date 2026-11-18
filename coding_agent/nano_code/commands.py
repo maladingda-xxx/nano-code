@@ -14,13 +14,14 @@ from rich.text import Text
 
 import tools
 from changes import list_checkpoints, preview_checkpoint, resolve_turn_id, restore_checkpoint, undo_last_edit
-from context_budget import estimate_tokens
+from context_budget import context_breakdown
 from execution_store import execution_session, pending_executions, recover_execution
 from workspace import workspace_path
 
 from . import __version__, sessions
 from .config import MODES
 from .extensions import expand_skill
+from .providers import effort_levels
 
 
 def expand_references(session, text):
@@ -43,6 +44,7 @@ def diagnostics(session):
         "version": __version__, "python": sys.version.split()[0], "executable": sys.executable,
         "workspace": str(session.root), "git": shutil.which("git"), "node": shutil.which("node"),
         "provider": session.config.data["provider"], "model": session.config.data["model"],
+        "effort": session.config.data["effort"] or "auto", "permission_mode": session.permissions.mode,
         "api_key_configured": bool(session.config.api_key), "project_extensions_trusted": session.config.trusted,
         "skills": len(session.skills), "mcp_configured": list(session.config.data["mcpServers"]),
         "extension_errors": session.extension_errors,
@@ -50,14 +52,19 @@ def diagnostics(session):
     }
 
 
-def execute_command(session, line, renderer, *, console=None):
+def execute_command(session, line, renderer, *, console=None, running=False):
     from .ui import COMMANDS, ACCENT, safe_text
     command, _, argument = line.partition(" ")
     argument = argument.strip()
     command = {"/load": "/resume", "/save": "/rename", "/stats": "/cost", "/rewind": "/checkpoints"}.get(command, command)
     readonly = {"/help", "/status", "/diff", "/output", "/context", "/cost", "/tasks", "/skills", "/agents", "/hooks", "/doctor", "/sessions"}
-    if session.busy and command not in readonly:
+    inspecting = not argument and command in {"/model", "/effort", "/permissions"}
+    if (session.busy or running) and command not in readonly and not inspecting:
         raise ValueError("当前任务运行中；请等待结束或 /cancel 后操作。")
+    if session.permissions.mode == "plan" and (
+        command in {"/undo", "/export", "/init"} or (argument and command in {"/memory", "/restore"})
+    ):
+        raise ValueError("计划模式下不能修改工作区文件。使用 /plan 退出计划模式。")
     out = renderer.console if console is None else console
     session._activate()
     if command == "/help":
@@ -136,41 +143,46 @@ def execute_command(session, line, renderer, *, console=None):
                 out.print("已恢复。结果不确定的操作需先核查；不会自动重放命令。")
     elif command == "/model":
         if argument:
-            session.config.data["model"] = argument
-            session.config.data.pop("effort", None)
-            if session.model is not None:
-                client = getattr(session.model, "client", None)
-                if client:
-                    client.close()
-                session.model = None
+            session.set_model(argument)
         out.print(Text(f"{session.config.data['provider']} / {session.config.data['model']}"))
+        if not argument:
+            out.print(Text("可选模型 · " + " / ".join(session.model_choices())))
     elif command == "/effort":
-        from .providers import effort_levels
-
         data = session.config.data
         levels = effort_levels(data)
-        if not levels:
+        if not levels and not argument:
             out.print(Text(f"{data['model']} 在当前 API 环境下没有可切换的推理强度。"))
             return
         choices = ("auto", *levels)
         if argument:
-            if argument not in choices:
-                raise ValueError(f"用法：/effort {' | '.join(choices)}")
-            data["effort"] = None if argument == "auto" else argument
-            if session.model is not None:
-                session.model.effort = data["effort"]
+            session.set_effort(argument)
         out.print(Text(f"当前推理强度：{data.get('effort') or 'auto'} · {' / '.join(choices)}"))
-    elif command in {"/permissions", "/plan"}:
+    elif command in {"/permissions", "/plan", "/auto"}:
+        if argument and command != "/permissions":
+            raise ValueError(f"用法：{command}")
         if command == "/plan":
-            argument = "default" if session.permissions.mode == "plan" else "plan"
-        if argument:
-            if argument not in MODES:
-                raise ValueError("可用模式：" + ", ".join(MODES))
-            session.permissions.mode = argument
-        out.print(Text(f"模式：{session.permissions.mode}。这是工具授权控制，不是操作系统沙箱。"))
-        out.print_json(json.dumps(session.permissions.rules, ensure_ascii=False))
+            session.toggle_plan()
+        elif command == "/auto":
+            session.set_permission_mode("default" if session.permissions.mode == "auto" else "auto")
+        elif argument:
+            session.set_permission_mode(argument)
+        out.print(Text(f"当前权限模式 · {session.permissions.mode}"))
+        if command == "/permissions":
+            out.print(Text("可用模式 · " + " / ".join(MODES)))
+            out.print_json(json.dumps(session.permissions.rules, ensure_ascii=False))
     elif command == "/context":
-        out.print(Text(f"约 {estimate_tokens(session.messages):,} / {session.config.data['context_limit']:,} tokens · {len(session.messages)} 条消息"))
+        budget = context_breakdown(session.messages, session.tool_schemas, limit=session.config.data["context_limit"])
+        table = Table(title="上下文预算估算（tokens）", box=box.SIMPLE)
+        table.add_column("项目")
+        table.add_column("估算", justify="right")
+        for label, tokens in (
+            ("消息", budget.messages), ("工具与协议", budget.overhead), ("回复预留", budget.reserved_output),
+            ("剩余输入空间", max(0, budget.remaining)), ("上下文上限", budget.limit),
+        ):
+            table.add_row(label, f"{tokens:,}")
+        out.print(table)
+        if budget.remaining < 0:
+            out.print(Text(f"当前消息超出输入预算约 {-budget.remaining:,} tokens，请使用 /compact 或缩短输入。"))
     elif command == "/compact":
         out.print(Text(session.compact(argument)))
     elif command == "/cost":

@@ -32,8 +32,10 @@ nano-code doctor
 | 审阅 | `/status` 查看 Git 状态，`/diff` 查看工作区差异，`/diff --staged` 查看暂存差异。`/output` 展开最近一轮工具输出，Ctrl+O 切换展开模式。 |
 | 会话 | `/sessions` 列表，`/resume <名称或 ID>` 恢复，`/rename` 重命名，`/fork` 复制对话。命令行支持 `--continue` 和 `--resume <ID>`。 |
 | 恢复 | `/undo` 回退当前会话的最近一次内置文件编辑。`/checkpoints <轮次 ID>` 预览，`/restore <轮次 ID>` 恢复该轮次。`/recover` 列出异常中断的轮次。 |
-| 上下文 | `/context` 查看估算用量，`/compact` 生成摘要并归档原始会话，`/cost` 查看模型报告的 token 用量，`/export` 导出对话。 |
-| 推理强度 | 直连官方 DeepSeek，使用 `deepseek-flash` 或 `deepseek-v4-pro` 时，`/effort` 查看，`/effort low`、`/effort high`、`/effort max` 切换。`/effort auto` 恢复 Nano Code 默认请求行为。其他组合显示当前阶段。 |
+| 模型 | `/model` 查看当前模型和候选项，`/model <ID>` 在当前服务内切换。输入 `/model ` 后可补全候选。用户设置中的 `models` 是可补全的模型 ID 列表。 |
+| 上下文 | `/context` 分别显示消息、工具与协议开销、回复预留和剩余输入空间的 token 估算。`/compact [重点]` 生成摘要，报告压缩前后用量，并给出可用 `/resume` 打开的原对话归档 ID。`/cost` 查看服务端用量，`/export` 导出对话。 |
+| 推理强度 | 直连官方 DeepSeek 且模型为 `deepseek-flash` 或 `deepseek-v4-pro` 时，`/effort` 显示级别，`/effort low`、`/effort high`、`/effort max` 切换。`/effort auto` 恢复适配器默认。启动时也可传 `--effort` 或设置 `REASONING_EFFORT`。 |
+| 权限模式 | `/plan` 进入只读计划，再输入一次会返回先前模式。`/auto` 开关自动模式，`/permissions` 查看或指定模式。Shift+Tab 在默认、接受编辑、计划和自动模式之间循环。 |
 | 项目约定 | 启动时读取 `CLAUDE.md` 和 `AGENTS.md`，访问不同子目录的文件时读取相应约定。`/init` 生成项目模板，`/memory` 维护项目记忆。 |
 
 恢复时会检查文件是否仍与 Nano Code 当时写入的内容一致，发现冲突会保留当前文件。可恢复范围包括通过 `edit_file` 和 `write_file` 完成的修改。测试命令、MCP 工具和 hooks 造成的外部变更需要用 Git 或对应系统的记录审阅。对话分支共用项目文件。需要独立修改文件时，请从两个 Git worktree 分别启动。
@@ -42,10 +44,13 @@ nano-code doctor
 
 - `default` 允许仓库内读取。编辑、外部命令和 MCP 调用需要确认。可按 `y` 允许一次，或按 `s` 在当前会话允许完全相同的操作。
 - `acceptEdits` 接受仓库范围内的内置文件编辑。外部命令和 MCP 调用仍有各自的授权检查。
-- `plan` 允许只读调查，关闭编辑、外部命令、MCP 工具和可执行 hooks。
+- `plan` 允许只读调查，关闭编辑、外部命令、MCP 工具和可执行 hooks。工作区写入类命令如 `/undo`、`/restore <ID>` 和 `/export` 也需先退出计划模式。
+- `auto` 自动允许工作区内置编辑和 `permissions.autoAllow` 中完全匹配工作目录和参数的命令。其他操作按现有授权流程处理。该模式使用本地规则。
 - `dontAsk` 禁用交互授权。外部操作必须有显式允许规则。`deny` 优先于 `allow`。权限控制在工具层，已授权外部程序仍以当前用户权限运行。
 
 可在用户或受信任的项目设置中配置确切的参数、目录和文件规则。例如 `{"permissions":{"allow":[{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}],"deny":[{"tool":"write_file","path":"deploy/*"}]}}`。项目中的可执行扩展和允许规则需要先使用 `/trust` 绑定当前配置，然后重启。内容修改后需要重新信任。
+
+如需只在自动模式预先批准一条测试命令，可在 `permissions.autoAllow` 中加入 `{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}`。也可以用 `nano-code --permission-mode auto` 启动。
 
 项目 `.nano/skills/<名称>/SKILL.md`、`.claude/skills/<名称>/SKILL.md` 或用户 `~/.nano-code/skills/<名称>/SKILL.md` 可以放可复用流程。`/skills` 查看，`/<名称> 参数` 手动调用。工具可按需加载允许模型调用的 Skill。子代理支持同样位置下的 `agents/<名称>.md`，它们用独立上下文做前台只读调查并返回结果。
 

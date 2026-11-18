@@ -64,7 +64,12 @@ def rename(uid, label):
     if not isinstance(label, str) or not label.strip() or len(label) > 120:
         raise ValueError("会话名称长度须为 1–120 个字符。")
     with closing(_connect()) as conn, conn:
-        conn.execute("INSERT INTO session_labels VALUES (?, ?) ON CONFLICT(uid) DO UPDATE SET label=excluded.label", (uid, label.strip()))
+        _set_label(conn, uid, label)
+
+
+def _set_label(conn, uid, label):
+    conn.execute("INSERT INTO session_labels VALUES (?, ?) ON CONFLICT(uid) DO UPDATE SET label=excluded.label",
+                 (uid, label.strip()))
 
 
 def fork(uid, messages, label=None):
@@ -72,6 +77,20 @@ def fork(uid, messages, label=None):
     if not save(new_uid, messages, label or f"Fork of {uid[:8]}"):
         raise ValueError("无法保存分支会话。")
     return new_uid
+
+
+def save_compaction(uid, original, compacted, label=None):
+    """Keep the full archive and replace the active history in one transaction."""
+    archive = uuid4().hex
+    with closing(_connect()) as conn, conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        legacy._write_session(conn, "__session_" + archive, original, uid=archive)
+        legacy._write_session(conn, "__session_" + uid, compacted, uid=uid)
+        _set_label(conn, archive, f"Before compact {uid[:8]}")
+        if label:
+            _set_label(conn, uid, label)
+    return archive
 
 
 def _alive(pid):

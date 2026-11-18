@@ -42,7 +42,11 @@ class Permissions:
             return False
         if name in READ_TOOLS or name in {"task_update", "ask_followup_question", "delegate"}:
             return True
-        if self.mode == "acceptEdits" and name in WRITE_TOOLS:
+        if self.mode in {"acceptEdits", "auto"} and name in WRITE_TOOLS:
+            return True
+        if self.mode == "auto" and name == "execute_command" and any(
+            self.matches(rule, name, arguments) for rule in self.rules.get("autoAllow", [])
+        ):
             return True
         signature = self.signature(name, arguments)
         if signature in self.grants or any(self.matches(r, name, arguments) for r in self.rules.get("allow", [])):

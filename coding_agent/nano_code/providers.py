@@ -8,20 +8,20 @@ import httpx
 from openai import OpenAI
 
 from cancellation import check_cancelled
-from context_budget import fit_request
+from context_budget import DEFAULT_MAX_OUTPUT, fit_request
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 from model_api import ChatModel, RequestUsage, _checked_reply
 
 
-def effort_levels(data):
+def bundled_models(data):
     endpoint = urlsplit(data["base_url"])
-    if (
-        data["provider"] == "openai" and endpoint.scheme == "https"
-        and endpoint.hostname == "api.deepseek.com"
-        and data["model"] in {"deepseek-flash", "deepseek-v4-pro"}
-    ):
-        return ("low", "high", "max")
+    if data["provider"] == "openai" and endpoint.scheme == "https" and endpoint.hostname == "api.deepseek.com":
+        return ("deepseek-flash", "deepseek-v4-pro")
     return ()
+
+
+def effort_levels(data):
+    return ("low", "high", "max") if data["model"] in bundled_models(data) else ()
 
 
 def create_model(config, tools):
@@ -80,7 +80,8 @@ class AnthropicModel:
 
     def __call__(self, messages, allow_tools, emit):
         d = self.config.data
-        fitted, output = fit_request(messages, self.tools if allow_tools else [], limit=self.context_limit, max_output=4096, emit=emit)
+        fitted, output = fit_request(messages, self.tools if allow_tools else [], limit=self.context_limit,
+                                     max_output=DEFAULT_MAX_OUTPUT, emit=emit)
         system, turns = anthropic_messages(fitted)
         payload = {"model": self.name, "system": system, "messages": turns, "max_tokens": output, "stream": self.streaming}
         if allow_tools:

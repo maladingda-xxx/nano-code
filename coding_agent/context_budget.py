@@ -2,10 +2,29 @@
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import cache
 from itertools import chain
 
 from exceptions import ContextBudgetError
+
+DEFAULT_MAX_OUTPUT = 4096
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    limit: int
+    messages: int
+    overhead: int
+    reserved_output: int
+
+    @property
+    def message_budget(self):
+        return self.limit - self.overhead - self.reserved_output
+
+    @property
+    def remaining(self):
+        return self.message_budget - self.messages
 
 
 @cache
@@ -29,6 +48,13 @@ def _estimate(value) -> int:
 
 def estimate_tokens(messages: list[dict]) -> int:
     return sum(4 + _estimate(message) for message in messages)
+
+
+def context_breakdown(messages, tools, *, limit: int, max_output: int = DEFAULT_MAX_OUTPUT) -> ContextBudget:
+    # Small context windows leave up to a quarter of their space for generation.
+    output = min(max_output, max(1, limit // 4))
+    overhead = 8 + (_estimate(tools) if tools else 0)
+    return ContextBudget(limit, estimate_tokens(messages), overhead, output)
 
 
 def _split_turns(messages: list[dict]) -> tuple[list[dict], list[list[dict]]]:
@@ -105,12 +131,9 @@ def fit_request(
     messages: list[dict], tools: list[dict], *, limit: int, max_output: int,
     emit: Callable[[dict], None],
 ) -> tuple[list[dict], int]:
-    # Small context windows leave up to a quarter of their space for generation.
-    output = min(max_output, max(1, limit // 4))
-    overhead = 8 + (_estimate(tools) if tools else 0)
-    budget = limit - output - overhead
-    before = estimate_tokens(messages)
-    if before <= budget:
+    breakdown = context_breakdown(messages, tools, limit=limit, max_output=max_output)
+    output, budget, before = breakdown.reserved_output, breakdown.message_budget, breakdown.messages
+    if breakdown.remaining >= 0:
         return _public(messages), output
 
     instructions, turns = _split_turns(messages)

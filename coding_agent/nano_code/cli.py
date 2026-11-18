@@ -46,6 +46,7 @@ def main(argv=None):
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--model")
+    parser.add_argument("--effort", help="reasoning effort for supported models, or auto")
     parser.add_argument("--provider", choices=("openai", "anthropic"))
     parser.add_argument("--base-url")
     parser.add_argument("--permission-mode", choices=MODES)
@@ -70,7 +71,7 @@ def main(argv=None):
 
     try:
         root = find_root(args.cwd.resolve())
-        override = {"model": args.model, "provider": args.provider, "base_url": args.base_url,
+        override = {"model": args.model, "effort": args.effort, "provider": args.provider, "base_url": args.base_url,
                     "max_turns": args.max_turns, "permission_mode": args.permission_mode}
         if args.allow_edits and not args.permission_mode:
             override["permission_mode"] = "acceptEdits"

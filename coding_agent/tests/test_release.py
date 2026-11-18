@@ -1,23 +1,28 @@
 import asyncio
 import io
 import json
+import sqlite3
 import sys
 from threading import Event, Thread
 from uuid import uuid4
 
 import httpx
 import pytest
+from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from rich.console import Console
 
 from agent_core import ModelReply
+from context_budget import context_breakdown, fit_request
 from nano_code import Session, sessions
 from nano_code.cli import main
+from nano_code.commands import execute_command
 from nano_code.config import Config, write_json
 from nano_code.mcp_client import MCPClient
 from nano_code.providers import AnthropicModel
 from nano_code.rpc import serve
-from nano_code.ui import interactive
+from nano_code.ui import InputCompleter, interactive
 
 
 @pytest.fixture
@@ -89,6 +94,126 @@ def test_plan_and_scoped_instructions(project):
         assert "Apply the nested convention." in result.text and not target.exists()
         assert session.dispatch(edit, lambda *_: None).status == "ok"
         assert target.read_text(encoding="utf-8") == "ok"
+
+
+def test_auto_rules_and_plan_toggle(project):
+    argv = ["python", "-c", "print('verified')"]
+    local = project / ".nano/settings.json"
+    write_json(local, {"permissions": {"autoAllow": [{"tool": "execute_command", "cwd": ".", "argv": argv}]}})
+    with Session(project, config=Config(project, overrides={"permission_mode": "auto"})) as untrusted:
+        assert untrusted.dispatch(call("execute_command", argv=argv), lambda _: None).status == "denied"
+    Config(project).trust()
+    approvals = []
+    console = Console(file=io.StringIO())
+    with Session(project, ask=lambda name, args: approvals.append((name, args)) or False) as session:
+        command = call("execute_command", argv=argv, verification=True)
+        assert session.dispatch(command, lambda _: None).status == "denied"
+        execute_command(session, "/auto", None, console=console)
+        assert session.dispatch(command, lambda _: None).exit_code == 0
+        assert len(approvals) == 1
+        different = call("execute_command", argv=[*argv[:-1], "print('different')"])
+        assert session.dispatch(different, lambda _: None).status == "denied"
+        (project / "subdir").mkdir()
+        assert session.dispatch(call("execute_command", argv=argv, cwd="subdir"), lambda _: None).status == "denied"
+        assert len(approvals) == 3
+
+        execute_command(session, "/plan", None, console=console)
+        assert session.dispatch(command, lambda _: None).status == "denied"
+        edit = call("write_file", file_path="result.txt", content="ok")
+        assert session.dispatch(edit, lambda _: None).status == "denied"
+        for line in ("/init", "/undo", "/restore abcd", "/memory example", "/export report.md"):
+            with pytest.raises(ValueError, match="计划模式"):
+                execute_command(session, line, None, console=console)
+        with pytest.raises(ValueError, match="运行中"):
+            execute_command(session, "/permissions auto", None, console=console, running=True)
+        execute_command(session, "/plan", None, console=console)
+        assert session.permissions.mode == "auto"
+        session.permissions.rules["deny"] = [{"tool": "execute_command", "argv": argv}]
+        assert session.dispatch(command, lambda _: None).status == "denied"
+        assert len(approvals) == 3
+        assert session.dispatch(edit, lambda _: None).status == "ok"
+        assert (project / "result.txt").read_text(encoding="utf-8") == "ok"
+
+
+def test_model_commands_and_context_keep_request_state(project, monkeypatch, capsys):
+    monkeypatch.setenv("REASONING_EFFORT", "low")
+    config = Config(project, overrides={"provider": "openai", "base_url": "https://api.deepseek.com",
+                    "model": "deepseek-flash", "models": ["deepseek-v4-pro"], "context_limit": 12000})
+    output = io.StringIO()
+    console = Console(file=output, width=100)
+    with Session(project, config=config) as session:
+        model = session.ensure_model()
+        model.requests_sent = 2
+        execute_command(session, "/model", None, console=console)
+        execute_command(session, "/effort high", None, console=console)
+        execute_command(session, "/model deepseek-flash", None, console=console)
+        assert model.effort == "high"
+        completer = InputCompleter(session)
+        assert [c.text for c in completer.get_completions(Document("/model deepseek-v"), None)] == ["deepseek-v4-pro"]
+        assert [c.text for c in completer.get_completions(Document("/effort m"), None)] == ["max"]
+        execute_command(session, "/model custom-model", None, console=console)
+        assert session.ensure_model() is model and model.requests_sent == 2
+        assert model.name == "custom-model" and model.effort is None
+        with pytest.raises(ValueError, match="/effort"):
+            execute_command(session, "/effort high", None, console=console)
+        execute_command(session, "/context", None, console=console)
+        budget = context_breakdown(session.messages, session.tool_schemas, limit=12000)
+        _, output_reserve = fit_request(session.messages, session.tool_schemas, limit=12000, max_output=4096,
+                                        emit=lambda _: None)
+        view = output.getvalue()
+        assert "deepseek-v4-pro" in view
+        assert "工具与协议" in view and f"{budget.overhead:,}" in view
+        assert "回复预留" in view and f"{output_reserve:,}" in view
+        assert "剩余输入空间" in view and f"{budget.remaining:,}" in view
+    assert main(["--cwd", str(project), "--base-url", "https://api.deepseek.com", "--model", "deepseek-flash",
+                 "--effort", "max", "doctor"]) == 0
+    assert json.loads(capsys.readouterr().out)["effort"] == "max"
+
+
+@pytest.mark.parametrize("outcome", ["saved", "non_reducing", "cancelled", "save_failed"])
+def test_compaction_preserves_original_history(project, monkeypatch, outcome):
+    monkeypatch.chdir(project)
+    long_text = "Detailed context to archive. " * 300
+
+    class Summarizer:
+        def summarize(self, messages, emit):
+            assert messages[-1]["content"].endswith("keep pending tests")
+            if outcome == "cancelled":
+                session.cancel()
+            return long_text * 4 if outcome == "non_reducing" else "Pending tests are recorded."
+
+    with Session(project, model=Summarizer()) as session:
+        session.messages += [{"role": "user", "content": long_text}, {"role": "assistant", "content": long_text}]
+        assert session.persist()
+        original = sessions.load(session.uid)["messages"]
+        if outcome == "save_failed":
+            write = sessions.legacy._write_session
+
+            def fail_active(conn, name, messages, uid):
+                if uid == session.uid:
+                    raise sqlite3.OperationalError("simulated save failure")
+                write(conn, name, messages, uid=uid)
+
+            monkeypatch.setattr(sessions.legacy, "_write_session", fail_active)
+        if outcome in {"cancelled", "save_failed"}:
+            with pytest.raises(KeyboardInterrupt if outcome == "cancelled" else sqlite3.OperationalError):
+                session.compact("keep pending tests")
+        else:
+            console = Console(file=io.StringIO())
+            execute_command(session, "/compact keep pending tests", None, console=console)
+            if outcome == "saved":
+                assert "→" in console.file.getvalue()
+            else:
+                assert "未缩小" in console.file.getvalue()
+        assert not session.busy
+
+        archives = [entry for entry in sessions.list_sessions() if entry["uid"] != session.uid]
+        if outcome == "saved":
+            assert len(archives) == 1 and sessions.load(archives[0]["uid"])["messages"] == original
+            assert "Pending tests" in sessions.load(session.uid)["messages"][1]["content"]
+        else:
+            assert not archives and sessions.load(session.uid)["messages"] == original
+            assert session.messages[1]["content"] == long_text
 
 
 def test_stale_resume_cannot_overwrite_newer_history(project):
@@ -219,5 +344,22 @@ def test_terminal_accepts_prompt_approval_and_exit(project):
             await asyncio.wait_for(terminal, timeout=3)
             assert session.last_result and session.last_result["status"] == "completed"
             assert (project / "result.txt").read_text(encoding="utf-8") == "ok"
+
+    asyncio.run(exercise())
+
+
+def test_terminal_cycles_permission_modes(project):
+    async def exercise():
+        with create_pipe_input() as pipe, Session(project) as session:
+            terminal = asyncio.create_task(interactive(session, terminal_input=pipe, terminal_output=DummyOutput()))
+            try:
+                for mode in ("acceptEdits", "plan", "auto", "default"):
+                    pipe.send_text("\x1b[Z")
+                    async with asyncio.timeout(3):
+                        while session.permissions.mode != mode:
+                            await asyncio.sleep(0.02)
+            finally:
+                pipe.send_text("/exit\r")
+                assert await asyncio.wait_for(terminal, timeout=3) == 0
 
     asyncio.run(exercise())

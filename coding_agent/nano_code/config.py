@@ -9,13 +9,19 @@ from dotenv import dotenv_values
 
 DEFAULTS = {
     "provider": "openai", "model": "deepseek-flash", "base_url": "https://api.deepseek.com",
+    "models": [], "effort": "auto",
     "api_key_env": "API_KEY", "permission_mode": "default", "max_turns": 24,
     "context_limit": 80000, "command_timeout": 120, "request_timeout": 60,
     "streaming": True, "temperature": 0.3, "theme": "dark",
     "top_p": 1.0, "max_retries": 3, "retry_base_delay": 0.5,
-    "permissions": {"allow": [], "deny": []}, "mcpServers": {}, "hooks": {},
+    "permissions": {"allow": [], "deny": [], "autoAllow": []}, "mcpServers": {}, "hooks": {},
 }
-MODES = ("default", "acceptEdits", "plan", "dontAsk")
+MODE_CYCLE = ("default", "acceptEdits", "plan", "auto")
+MODES = (*MODE_CYCLE, "dontAsk")
+
+
+def valid_model_id(value):
+    return isinstance(value, str) and bool(value) and not any(c.isspace() or ord(c) < 32 for c in value)
 
 
 def config_home():
@@ -80,6 +86,7 @@ class Config:
         values.update(os.environ)
         self.env = values
         mapping = {"MODEL_NAME": "model", "BASE_URL": "base_url", "MODEL_PROVIDER": "provider",
+                   "REASONING_EFFORT": "effort",
                    "MAX_TOOL_ROUNDS": "max_turns", "CONTEXT_LIMIT_TOKENS": "context_limit",
                    "COMMAND_TIMEOUT_SECONDS": "command_timeout", "MAX_MODEL_REQUESTS": "request_limit",
                    "TEMPERATURE": "temperature", "TOP_P": "top_p", "MAX_RETRIES": "max_retries",
@@ -101,6 +108,11 @@ class Config:
             raise ValueError(f"permission_mode 必须是 {', '.join(MODES)}")
         if self.data["provider"] not in {"openai", "anthropic"}:
             raise ValueError("provider 必须是 openai 或 anthropic")
+        if not valid_model_id(self.data["model"]):
+            raise ValueError("model 必须是无空白的模型 ID。")
+        models = self.data["models"]
+        if not isinstance(models, list) or not all(valid_model_id(model) for model in models):
+            raise ValueError("models 必须是模型 ID 列表。")
         for key in ("max_turns", "context_limit", "command_timeout", "request_timeout", "max_retries"):
             self.data[key] = int(self.data[key])
             if self.data[key] <= 0:
@@ -119,13 +131,24 @@ class Config:
         for key in ("permissions", "hooks", "mcpServers"):
             if not isinstance(self.data[key], dict):
                 raise ValueError(f"{key} 必须是对象")
-        for key in ("allow", "deny"):
+        for key in ("allow", "deny", "autoAllow"):
             if not isinstance(self.data["permissions"].get(key, []), list):
                 raise ValueError(f"permissions.{key} 必须是数组")
+        for rule in self.data["permissions"].get("autoAllow", []):
+            if not isinstance(rule, dict) or set(rule) != {"tool", "cwd", "argv"} or rule["tool"] != "execute_command":
+                raise ValueError("permissions.autoAllow 需要精确的 execute_command、cwd 和 argv 规则。")
+            argv, cwd = rule["argv"], rule["cwd"]
+            if (not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv)
+                    or not argv[0].strip() or not isinstance(cwd, str) or not cwd.strip()):
+                raise ValueError("permissions.autoAllow 需要非空的 cwd 和命令参数数组。")
         from urllib.parse import urlsplit
         url = urlsplit(self.data["base_url"])
         if url.scheme not in {"https", "http"} or not url.hostname or url.username or url.password:
             raise ValueError("base_url 必须是无内嵌凭据的 HTTP(S) 地址")
+        from .providers import effort_levels
+        effort = self.data["effort"]
+        if effort not in (None, "auto", *effort_levels(self.data)):
+            raise ValueError("当前模型或 API 端点不支持所配置的推理强度。")
 
     @property
     def api_key(self):

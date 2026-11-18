@@ -15,4 +15,9 @@
 
 - [X] T006 补齐 `coding_agent/tests/` 的命令和权限回归，更新 `docs/terminal.md` 并运行测试。
 
-任务依序执行。T006 覆盖三组独立验收场景。结果见[验证步骤](quickstart.md#本轮验证记录)。
+## Auto 分类审查
+
+- [X] T007 [US3] 在 `coding_agent/nano_code/permissions.py` 和 `runtime.py` 接入独立审查，在 `cli.py` 和 `ui.py` 保留用户原始请求。验证明确允许、拒绝、异常和取消的路径。
+- [X] T008 [US3] 从无预配规则的终端任务验证自动执行测试命令，记录模型审查、工具结果和提示行为，再补齐文档。
+
+任务依序执行。结果见[验证步骤](quickstart.md#本轮验证记录)。

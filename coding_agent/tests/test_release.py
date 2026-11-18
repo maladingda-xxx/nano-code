@@ -16,9 +16,9 @@ from rich.console import Console
 from agent_core import ModelReply
 from exceptions import AgentAPIError
 from context_budget import context_breakdown, fit_request
-from nano_code import Session, sessions
+from nano_code import Session, __version__, sessions
 from nano_code.cli import main
-from nano_code.commands import execute_command
+from nano_code.commands import diagnostics, execute_command, redact
 from nano_code.config import Config, write_json
 from nano_code.mcp_client import MCPClient
 from nano_code.providers import AnthropicModel
@@ -258,6 +258,46 @@ def test_model_commands_and_context_keep_request_state(project, monkeypatch, cap
     assert main(["--cwd", str(project), "--base-url", "https://api.deepseek.com", "--model", "deepseek-flash",
                  "--effort", "max", "doctor"]) == 0
     assert json.loads(capsys.readouterr().out)["effort"] == "max"
+
+
+def test_doctor_export_redacts_credentials(project, tmp_path, monkeypatch, capsys):
+    secret = "sk-test-export-secret-1234567890"
+    monkeypatch.setenv("API_KEY", secret)
+    target = tmp_path / "diag.json"
+    assert main(["--cwd", str(project), "--export", str(target), "doctor"]) == 0
+    text = target.read_text(encoding="utf-8")
+    assert secret not in text
+    data = json.loads(text)
+    assert data["version"] == __version__
+    assert data["session_format"] == 1
+    assert data["api_key_configured"] is True
+    assert data["session_db"].endswith(".coding_agent_sessions.db")
+    assert str(target) in capsys.readouterr().out
+
+
+def test_doctor_export_rejects_directory(project, tmp_path, capsys):
+    assert main(["--cwd", str(project), "--export", str(tmp_path), "doctor"]) == 2
+    assert "目录" in capsys.readouterr().err
+
+
+def test_redact_masks_fields_and_tokens():
+    data = redact({
+        "token": "abc",
+        "api_key_configured": True,
+        "nested": {"password": "hidden", "note": "Authorization: Bearer abcdefghijklmnop"},
+    })
+    assert data["token"] == "[REDACTED]"
+    assert data["nested"]["password"] == "[REDACTED]"
+    assert "[REDACTED]" in data["nested"]["note"]
+    assert data["api_key_configured"] is True
+
+
+def test_diagnostics_without_key(project):
+    with Session(project) as session:
+        session.config.env = {}
+        data = diagnostics(session)
+    assert data["api_key_configured"] is False
+    assert data["session_format"] == 1
 
 
 @pytest.mark.parametrize("outcome", ["saved", "non_reducing", "cancelled", "save_failed"])

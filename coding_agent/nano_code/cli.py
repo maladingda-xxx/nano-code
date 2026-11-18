@@ -54,6 +54,7 @@ def main(argv=None):
     parser.add_argument("--allow-command", action="append", type=parse_argv, default=[])
     parser.add_argument("--allow-edits", action="store_true", help="permit workspace edits in headless mode")
     parser.add_argument("--mcp", action="append", default=[], metavar="SERVER", help="explicitly authorize connection to a configured server")
+    parser.add_argument("--export", type=Path, metavar="PATH", help="write redacted diagnostics from the doctor command to PATH")
     parser.add_argument("--version", action="version", version=f"Nano Code {__version__}")
     args = parser.parse_args(argv)
     errors = Console(stderr=True)
@@ -66,6 +67,8 @@ def main(argv=None):
     text = args.print_prompt if args.print_prompt is not None else args.prompt
     output = "stream-json" if args.json else args.output_format
     headless = args.print_prompt is not None or output != "text" or not sys.stdin.isatty()
+    if args.export is not None and (text != "doctor" or args.print_prompt is not None):
+        parser.error("--export requires the doctor command")
     if args.rpc and text is not None:
         parser.error("--rpc receives prompts from stdin")
 
@@ -81,8 +84,11 @@ def main(argv=None):
         resume = args.resume if args.resume is not None else "" if args.continue_session else None
         with Session(args.cwd, config=config, resume=resume, fork_session=args.fork_session) as session:
             if text == "doctor" and args.print_prompt is None:
-                from .commands import diagnostics
-                print(json.dumps(diagnostics(session), ensure_ascii=True, indent=2))
+                from .commands import diagnostics, export_diagnostics
+                if args.export is not None:
+                    print(str(export_diagnostics(session, args.export)))
+                else:
+                    print(json.dumps(diagnostics(session), ensure_ascii=True, indent=2))
                 return 0
             if text == "sessions" and args.print_prompt is None:
                 print(json.dumps(sessions.list_sessions(), ensure_ascii=True, indent=2))

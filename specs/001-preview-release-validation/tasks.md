@@ -23,8 +23,17 @@
 ## US3 · 平台、模型与试用
 
 - [x] T007 [US3] 用 `nano-code` 主入口在固定目标仓库完成 I01 只读冒烟验证。
-- [X] T008 [US3] 核对 `.github/workflows/ci.yml` 在候选提交 `0840f82` 上的三平台验证结果。Windows、Linux、macOS 的 Python 3.11 和 3.13 共六组均通过。[GitHub Actions](https://github.com/maladingda-xxx/nano-code/actions/runs/44241914861)
-- [ ] T009 [US3] 验证 `coding_agent/nano_code/providers.py` 支持的第二种模型服务，记录文本、工具调用、流式输出与用量。本地协议演练已通过，真实验证待 Anthropic 配置。[执行方法](quickstart.md#t009--anthropic-真实服务验证)
-- [ ] T010 [US3] 按 [产品开发计划](../../plan.md) 完成外部用户试用并记录问题与验证范围。内部演练和反馈表已就绪，待试用者在自己的项目中执行。[试用步骤](quickstart.md#t010--外部开发者试用)
+- [X] T008 [US3] 核对 `.github/workflows/ci.yml` 在候选提交 `0840f82` 上的三平台验证结果。Windows、Linux、macOS 的 Python 3.11 和 3.13 共六组均通过。[GitHub Actions](https://github.com/maladingda-xxx/nano-code/actions/runs/44241914861) 2026-11-18 以相同矩阵复核当前 HEAD `65ede79`，六组全部通过（[运行 44259016156](https://github.com/maladingda-xxx/nano-code/actions/runs/44259016156)）。
+- [ ] T009 [US3] **阻塞未验证**：验证 `coding_agent/nano_code/providers.py` 支持的第二种模型服务，记录文本、工具调用、流式输出与用量。本地协议演练已通过；真实服务缺少可用 Anthropic API Key 和模型 ID。[执行方法](quickstart.md#t009--anthropic-真实服务验证)
+- [ ] T010 [US3] **阻塞未验证**：按 [产品开发计划](../../plan.md) 完成外部用户试用并记录问题与验证范围。内部演练和反馈表已就绪；尚无外部试用者完成安装、配置和真实任务。[试用步骤](quickstart.md#t010--外部开发者试用)
 
 T003 先于 T004。T011 和 T012 在首轮基线完成后依序执行。恢复测试和主入口测试沿用固定目标副本。记录的每项结论对应实际运行的提交和入口。
+
+## 当前阻塞项
+
+| 任务 | 状态 | 阻塞原因 | 解除条件 | 责任人 |
+| --- | --- | --- | --- | --- |
+| T009 | 未验证 | 环境中没有可用的 `ANTHROPIC_API_KEY` 和模型 ID；`ANTHROPIC_AUTH_TOKEN` 属于 Claude Code 会话凭据，不能作为项目模型服务凭据 | 提供 Anthropic API Key 和模型 ID，用 `anthropic` 适配器完成一次文本、工具调用、流式输出和用量记录 | 项目所有者 |
+| T010 | 未验证 | 需要真实开发者在自己的仓库中独立使用，自动化无法代替 | 至少一名外部试用者按 quickstart 完成安装、配置和一个真实任务，并回收问题记录 | 项目所有者 / 外部试用者 |
+
+两项在解除前不得在路线图中标记为完成。

@@ -4,6 +4,14 @@
 - **候选提交** `0840f828ba2b41ece23e425c01854d48085a0893`
 - **模型** `deepseek-flash`，DeepSeek 官方接口。
 
+## 当前候选提交复核（2026-11-18）
+
+- **候选提交** `65ede790d3bc4b45cadde40089118fa6ee359dfd`（`main`，工作区无未提交代码改动）
+- **版本** `0.6.0`
+- **测试** 82 项通过。解释器 Python 3.11.4，pytest 9.2.0，命令 `.\.cache\verify-venv\Scripts\python.exe -m pytest coding_agent/tests -q`，用时 11.35 秒。
+- **CI** 通过。Nano Code CI 在 `65ede79` 的 push 运行 [44259016156](https://github.com/maladingda-xxx/nano-code/actions/runs/44259016156) 于 2026-11-18T07:27:25Z 触发，1 分 33 秒完成；Windows、Linux、macOS × Python 3.11/3.13 六组 job 全部 `success`。
+- **复核过程** 首次查询因本机 `GITHUB_TOKEN` 无效返回 `HTTP 401`、未认证 GitHub API 返回 `HTTP 403`，当时标为 `unverified`。清除环境变量并完成 `gh auth login` 后，按完整提交哈希查询并确认上述结果。
+
 ## 固定任务基线
 
 八项任务通过 `evals/run.py` 使用兼容入口执行，报告中源码目录均为干净状态。两项脚本恢复沿用 `evals/recovery.py`。独立评测器以原固定判定给出 **9/10 通过**，共 47 次请求和 195,083 个服务商报告的 token。
@@ -34,6 +42,16 @@
 - **I08 复测通过。** 沿用首轮验收用例，报告中的用例哈希一致。新候选将 1 字节对应的长度从首轮的 `0` 修正为 `2`，独立测试 9 项全部通过。3 次请求，9,703 tokens，报告目录 `I08-gspllqmq`。
 
 更新验收测试后，固定任务集的 10 项离线预检全部通过。
+
+## 已知限制
+
+### I06 旧版压缩载荷兼容性
+
+- **状态** 已知限制，未修复。
+- **表现** I06 的固定判定通过，但用 ItsDangerous 2.2.0 生成的压缩载荷复测时，候选把压缩标记从 `.` 改为 `_`，旧载荷解码得到 `BadPayload`。首轮和复测均复现，复测独立测试为 4 项通过、2 项失败。
+- **影响范围** 只影响 I06 任务中模型生成的候选补丁，以及读取 ItsDangerous 2.2.0 旧压缩载荷的兼容性；Nano Code 运行时本身没有该缺陷。
+- **现有检查** `evals/checks/url_safe_roundtrip.py` 的 `test_loads_compressed_payload_from_2_2_0` 会捕获该问题；固定任务判定保留通过，兼容性结果在本节单独记录。
+- **后续** 若要提高模型通过率，应单独立项调整任务提示或增加兼容性引导，并用新的真实评测运行验证。本轮不修改固定任务判定，也不发起新的付费模型请求。
 
 ## 主入口与恢复体验
 

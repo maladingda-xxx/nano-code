@@ -1,6 +1,7 @@
 """User-facing commands; mutations are explicit and never inferred from model text."""
 
 import json
+import platform
 import re
 import shutil
 import sys
@@ -16,6 +17,7 @@ import tools
 from changes import list_checkpoints, preview_checkpoint, resolve_turn_id, restore_checkpoint, undo_last_edit
 from context_budget import context_breakdown
 from execution_store import execution_session, pending_executions, recover_execution
+from session_store import SESSION_FORMAT_VERSION, _get_db_path
 from workspace import workspace_path
 
 from . import __version__, sessions
@@ -40,16 +42,55 @@ def expand_references(session, text):
 
 
 def diagnostics(session):
+    session_db = Path(_get_db_path()).resolve()
     return {
-        "version": __version__, "python": sys.version.split()[0], "executable": sys.executable,
-        "workspace": str(session.root), "git": shutil.which("git"), "node": shutil.which("node"),
+        "version": __version__, "session_format": SESSION_FORMAT_VERSION,
+        "python": sys.version.split()[0], "executable": sys.executable,
+        "platform": f"{platform.system()} {platform.release()}",
+        "workspace": str(session.root), "config_home": str(session.config.home),
+        "session_db": str(session_db),
+        "git": shutil.which("git"), "node": shutil.which("node"),
         "provider": session.config.data["provider"], "model": session.config.data["model"],
         "effort": session.config.data["effort"] or "auto", "permission_mode": session.permissions.mode,
         "api_key_configured": bool(session.config.api_key), "project_extensions_trusted": session.config.trusted,
         "skills": len(session.skills), "mcp_configured": list(session.config.data["mcpServers"]),
         "extension_errors": session.extension_errors,
-        "checks": {"python_supported": sys.version_info >= (3, 11), "workspace_exists": session.root.is_dir()},
+        "checks": {"python_supported": sys.version_info >= (3, 11), "workspace_exists": session.root.is_dir(),
+                   "session_db_exists": session_db.is_file()},
     }
+
+
+SENSITIVE_FIELD = re.compile(r"(api[_-]?key|token|secret|password|authorization)", re.IGNORECASE)
+SENSITIVE_VALUE = re.compile(
+    r"(sk-[A-Za-z0-9_-]{8,}|gh[opsu]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|"
+    r"Bearer\s+[A-Za-z0-9._-]{8,})",
+    re.IGNORECASE,
+)
+
+
+def redact(value, field=""):
+    """Recursively mask credentials while keeping non-secret diagnostic values."""
+    if isinstance(value, dict):
+        return {key: redact(item, key) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact(item, field) for item in value]
+    if isinstance(value, str):
+        if SENSITIVE_FIELD.search(field):
+            return "[REDACTED]"
+        return SENSITIVE_VALUE.sub("[REDACTED]", value)
+    return value
+
+
+def export_diagnostics(session, target):
+    path = Path(target).expanduser()
+    if path.exists() and path.is_dir():
+        raise ValueError(f"导出路径是目录: {path}")
+    data = redact(diagnostics(session))
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"无法写入诊断记录: {path}: {error}") from error
+    return path
 
 
 def execute_command(session, line, renderer, *, console=None, running=False):

@@ -80,7 +80,34 @@ with Session(".", emit=print) as session:
 
 ## 升级和排查
 
-`nano-code doctor` 检查配置、解释器和工具链。原 SQLite 会话可继续通过 `/sessions` 或 `--continue` 使用。旧入口仍可用 `nano-code-legacy` 启动。升级前关闭其他 Nano Code 进程，并备份项目根目录的 `.coding_agent_sessions.db`。它可能包含原始对话、工具输出和文件快照，导出或共享前应审阅。
+`nano-code doctor` 检查配置、解释器和工具链，输出当前版本、数据格式版本、模型、路径和检查结果。当前会话数据格式版本为 `1`。原 SQLite 会话可继续通过 `/sessions` 或 `--continue` 使用。旧入口仍可用 `nano-code-legacy` 启动。
+
+诊断记录可以写成 JSON 便于排查：
+
+```powershell
+nano-code doctor --export .\diag.json
+```
+
+导出内容包含版本、数据格式版本、平台、模型、配置目录、会话数据库路径和检查结果。API Key、令牌、密码等字段在写入前会被遮蔽为 `[REDACTED]`，常见令牌前缀也会处理；分享前仍应自行审阅。
+
+### 存储位置
+
+| 位置 | 内容 |
+|---|---|
+| `~/.nano-code/settings.json` | 用户设置；`NANO_CODE_HOME` 可指定其他目录 |
+| `~/.nano-code/.env` | 仅供本机使用的凭据 |
+| `<项目>/.nano/settings.json`、`.nano/settings.local.json` | 受信任项目的设置覆盖 |
+| `<项目>/.coding_agent_sessions.db` | 对话、工具输出、文件快照、检查点和撤销记录 |
+
+源码安装时仍会读取 `coding_agent/.env`。项目设置中的可执行扩展和允许规则需要先 `/trust`。
+
+### 备份和清理
+
+清理前关闭其他 Nano Code 进程。需要保留历史时，先用 `/export` 导出对话，或复制 `.coding_agent_sessions.db`。
+
+删除数据库会丢失 `/sessions`、`/resume`、`/checkpoints`、`/restore` 和 `/undo` 的记录，但不会修改或回滚工作区里的文件。文件名和路径变化后，旧检查点也会失去可恢复性。数据库可能包含原始对话、工具输出和文件快照，导出、备份或共享前应审阅。
+
+重置凭据可删除 `~/.nano-code/.env` 并重新配置；删除用户设置会恢复默认模型配置。
 
 本版本覆盖本地 CLI 常用工作流。Claude Code 的 IDE、桌面、云端、Remote Control、账号体系、托管集成、插件市场、Agent Teams、系统沙箱和自动授权分类器仍有差异。MCP OAuth、完整 hooks 事件集和 Claude Code 的设置格式也尚未覆盖。
 

@@ -24,6 +24,10 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+# Current layout of the session database and file snapshots. Bump this when the
+# stored format changes and a migration or compatibility note is required.
+SESSION_FORMAT_VERSION = 1
+
 _workspace_root: Path | None = None
 
 

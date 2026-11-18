@@ -17,15 +17,15 @@ _SPRITE = (
     ".OOOAY.",
 )
 _COLORS = {
-    "Y": "#ffb92f",  # golden highlights
-    "A": "#f9a02a",  # hat and robe
-    "O": "#f47b28",  # brim and robe shadows
-    "S": "#ae4c25",  # deep orange shadow
-    "W": "#fff8f1",  # hat edge and beard
-    "E": "#443437",  # eye and hair
-    "C": "#ffcfab",  # face
-    "D": "#24293d",  # eye shadow
-    "P": "#ed9869",  # cheek
+    "Y": "#a5b4fc",  # periwinkle highlights
+    "A": "#3b5bdb",  # midnight-blue hat and robe
+    "O": "#263a7a",  # brim and robe shadows
+    "S": "#17224d",  # deep navy shadow
+    "W": "#eef2ff",  # hat edge and beard
+    "E": "#151c33",  # eye and hair
+    "C": "#e4e9f7",  # cool light face
+    "D": "#0f172a",  # eye shadow
+    "P": "#8aa4ff",  # cheek
 }
 
 

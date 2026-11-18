@@ -14,7 +14,10 @@ from prompt_toolkit.completion import Completer, Completion, PathCompleter
 from prompt_toolkit.filters import Condition, is_done
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import ConditionalContainer, FormattedTextControl, HSplit, Window
+from prompt_toolkit.layout import ConditionalContainer, FloatContainer, FormattedTextControl, HSplit, ScrollOffsets, Window
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.margins import ScrollbarMargin
+from prompt_toolkit.layout.menus import CompletionsMenu, CompletionsMenuControl
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rich.console import Console, Group
@@ -31,7 +34,15 @@ from .mascot import mascot
 from .providers import effort_levels
 from .work_status import WorkStatus
 
-ACCENT = "#d68c6e"
+ACCENT = "#5b7cfa"
+ACCENT_STRONG = "#3b5bdb"
+ACCENT_LIGHT = "#8aa4ff"
+ACCENT_DARK = "#1e3a8a"
+ACCENT_SOFT = "#a5b4fc"
+MUTED = "#8494b4"
+SUCCESS = "#2f9e82"
+WARNING = "#c98a2e"
+ERROR = "#d05c68"
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 COMMANDS = {
     "/help": "命令与快捷键", "/clear": "保存当前会话并开始新会话", "/exit": "保存并退出",
@@ -49,7 +60,7 @@ COMMANDS = {
     "/memory": "查看或追加项目记忆", "/init": "为当前项目创建 AGENTS.md 模板",
     "/doctor": "检查配置和运行环境", "/cancel": "取消当前任务", "/queue": "查看待执行消息",
     "/clear-queue": "清空待执行消息",
-    "/theme": "切换 dark / light 主题", "/trust": "审阅并信任项目扩展配置",
+    "/theme": "切换 midnight blue dark / light 主题", "/trust": "审阅并信任项目扩展配置",
 }
 
 
@@ -68,7 +79,7 @@ class InputCompleter(Completer):
         if before.startswith("/") and " " not in before:
             for name, detail in {**COMMANDS, **{"/" + s.name: s.description for s in self.session.skills.values()}}.items():
                 if name.startswith(before):
-                    yield Completion(name, start_position=-len(before), display_meta=detail)
+                    yield Completion(name, start_position=-len(before), display=f" {name}", display_meta=f"  {detail}")
         else:
             command, _, argument = before.partition(" ")
             if command in {"/model", "/effort", "/permissions"}:
@@ -80,13 +91,41 @@ class InputCompleter(Completer):
                 }[command]
                 for choice in choices:
                     if choice.startswith(prefix):
-                        yield Completion(choice, start_position=-len(prefix))
+                        yield Completion(choice, start_position=-len(prefix), display=f" {choice}")
                 return
             word = document.get_word_before_cursor(WORD=True)
             if word.startswith("@"):
                 from prompt_toolkit.document import Document
                 for item in self.paths.get_completions(Document(word[1:]), complete_event):
                     yield item
+
+
+class BorderedCompletionsMenu(ConditionalContainer):
+    """Native completion menu with thin rules above and below the list."""
+
+    def __init__(self, *, filter, max_height=16, scroll_offset=1):
+        body = Window(
+            content=CompletionsMenuControl(),
+            width=Dimension(min=8),
+            height=Dimension(min=1, max=max_height),
+            scroll_offsets=ScrollOffsets(top=scroll_offset, bottom=scroll_offset),
+            right_margins=[ScrollbarMargin(display_arrows=False)],
+            dont_extend_width=True,
+            style="class:completion-menu",
+        )
+        top = Window(height=1, char="─", style="class:completion-border")
+        bottom = Window(height=1, char="─", style="class:completion-border")
+        super().__init__(content=HSplit([top, body, bottom]), filter=filter)
+
+
+def install_bordered_completion_menu(prompt):
+    """Swap prompt_toolkit's plain completion menu for a bordered one."""
+    for container in prompt.app.layout.walk():
+        if not isinstance(container, FloatContainer):
+            continue
+        for item in container.floats:
+            if isinstance(item.content, CompletionsMenu):
+                item.content = BorderedCompletionsMenu(filter=item.content.filter)
 
 
 class Renderer:
@@ -99,7 +138,7 @@ class Renderer:
         self.started = time.monotonic()
 
     def welcome(self, session):
-        title = Text.assemble(("Nano Code", "bold"), (f" v{__version__}", "dim"))
+        title = Text.assemble(("Nano Code", f"bold {ACCENT}"), (f" v{__version__}", "dim"))
         details = Group(
             title,
             Text(safe_text(session.config.data["model"]), style="dim", overflow="fold"),
@@ -150,21 +189,21 @@ class Renderer:
             content = safe_text(event["result"])
             status = event["outcome"]["status"]
             if self.expanded:
-                self.console.print(Text(content, style="dim" if status == "ok" else "yellow"))
+                self.console.print(Text(content, style="dim" if status == "ok" else WARNING))
             else:
                 lines = content.splitlines()
-                self.console.print(Text("  ⎿  " + (lines[0][:160] if lines else status), style="dim" if status == "ok" else "yellow"))
+                self.console.print(Text("  ⎿  " + (lines[0][:160] if lines else status), style="dim" if status == "ok" else WARNING))
                 if len(lines) > 1:
                     self.console.print(Text(f"     +{len(lines)-1} lines · /output 展开", style="dim"))
         elif kind in {"error", "notice", "recovery_error"}:
-            self.console.print(Text("  " + safe_text(event["text"]), style="yellow" if kind == "notice" else "red"))
+            self.console.print(Text("  " + safe_text(event["text"]), style=WARNING if kind == "notice" else ERROR))
         elif kind == "subagent_start":
             self.console.print(Text(f"● {event['agent']}  ·  read-only subagent", style=ACCENT))
         elif kind == "turn_end":
             state = event["verification"]["status"]
             label = {"passed": "验证通过", "failed": "验证失败", "not_run": "未运行验证", "stale": "修改后需要重新验证", "inconclusive": "验证结果不确定"}.get(state, state)
             files = len(event.get("changes", {}).get("files", []))
-            self.console.print(Text(f"  {event['status']} · {time.monotonic()-self.started:.1f}s · {files} 个文件 · {label}", style="green" if state == "passed" else "dim"))
+            self.console.print(Text(f"  {event['status']} · {time.monotonic()-self.started:.1f}s · {files} 个文件 · {label}", style=SUCCESS if state == "passed" else "dim"))
             self.console.print()
 
     def finish_stream(self):
@@ -248,11 +287,12 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     @bindings.add("s-tab")
     def change_mode(event):
-        if session.busy or work.active or command_running or not prompts.empty():
+        if any(not item["future"].done() for item in pending):
             return
         current = session.permissions.mode
         following = (MODE_CYCLE.index(current) + 1) % len(MODE_CYCLE) if current in MODE_CYCLE else 0
-        session.set_permission_mode(MODE_CYCLE[following])
+        session.set_permission_mode(MODE_CYCLE[following], allow_busy=True)
+        event.app.invalidate()
 
     @bindings.add("c-o")
     def expand(event):
@@ -269,10 +309,29 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     def toolbar():
         mode = session.permissions.mode
-        if prompt.app.output.get_size().columns < 58:
-            return [("class:toolbar", f" {mode} · queue {prompts.qsize()} ")]
-        context = estimate_tokens(session.messages)
-        return [("class:toolbar", f" {mode}  │  {session.uid[:8]}  │  ~{context:,}/{session.config.data['context_limit']:,} tokens  │  queue {prompts.qsize()} ")]
+        label = {
+            "default": "default mode on",
+            "acceptEdits": "accept edits mode on",
+            "plan": "plan mode on",
+            "auto": "auto mode on",
+            "dontAsk": "don't ask mode on",
+        }.get(mode, f"{mode} mode on")
+        hint = " (shift+tab to cycle)" if mode in MODE_CYCLE else " (/permissions to change)"
+        mode_style = {
+            "default": "class:toolbar.mode.default",
+            "acceptEdits": "class:toolbar.mode.accept",
+            "plan": "class:toolbar.mode.plan",
+            "auto": "class:toolbar.mode.auto",
+            "dontAsk": "class:toolbar.mode.dontask",
+        }.get(mode, "class:toolbar.mode")
+        width = prompt.app.output.get_size().columns
+        fragments = [(mode_style, f" ⏵⏵ {label}")]
+        if width >= 58:
+            fragments.append(("class:toolbar.hint", hint))
+        if width >= 105:
+            context = estimate_tokens(session.messages)
+            fragments.append(("class:toolbar", f"  │  {session.uid[:8]}  │  ~{context:,}/{session.config.data['context_limit']:,} tokens  │  queue {prompts.qsize()} "))
+        return fragments
 
     try:
         session.config.home.mkdir(parents=True, exist_ok=True)
@@ -280,12 +339,55 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
     except OSError:
         history = InMemoryHistory()
     def theme():
-        light = session.config.data["theme"] == "light"
-        return Style.from_dict({"prompt": "#a84d37 bold" if light else "#d68c6e bold",
-            "toolbar": "bg:#f3e9e2 #403128" if light else "bg:#262626 #bdbdbd",
-            "work.label": "#a84d37 bold" if light else "#f1a56c bold",
-            "work.note": "#f3ad58", "work.detail": "#736059" if light else "#b5a9a0",
-            "completion-menu.completion.current": "bg:#d68c6e #161616"})
+        if session.config.data["theme"] == "light":
+            return Style.from_dict({
+                "prompt": f"{ACCENT_DARK} bold",
+                "bottom-toolbar": "bg:#e8edf9 #22304d noreverse",
+                "toolbar": "bg:#e8edf9 #22304d noreverse",
+                "toolbar.mode": "bg:#e8edf9 #1e3a8a bold noreverse",
+                "toolbar.mode.default": "bg:#e8edf9 #1e3a8a bold noreverse",
+                "toolbar.mode.accept": "bg:#e8edf9 #7e22ce bold noreverse",
+                "toolbar.mode.plan": "bg:#e8edf9 #b45309 bold noreverse",
+                "toolbar.mode.auto": "bg:#e8edf9 #15803d bold noreverse",
+                "toolbar.mode.dontask": "bg:#e8edf9 #be123c bold noreverse",
+                "toolbar.hint": "bg:#e8edf9 #5b6b85 noreverse",
+                "work.label": f"{ACCENT_DARK} bold",
+                "work.note": "#4c6ef5",
+                "work.detail": "#5b6b85",
+                "completion-menu": "bg:#f4f7ff #1e2a4a",
+                "completion-border": "bg:#f4f7ff #b8c7e6",
+                "completion-menu.completion": "bg:#f4f7ff #1e3a8a",
+                "completion-menu.completion.current": "bg:#f4f7ff #0b255e bold noreverse",
+                "completion-menu.meta.completion": "bg:#f4f7ff #5b6b85",
+                "completion-menu.meta.completion.current": "bg:#f4f7ff #1e3a8a noreverse",
+                "completion-menu.multi-column-meta": "bg:#f4f7ff #5b6b85",
+                "scrollbar.background": "bg:#f4f7ff",
+                "scrollbar.button": "bg:#8aa4ff",
+            })
+        return Style.from_dict({
+            "prompt": f"{ACCENT_LIGHT} bold",
+            "bottom-toolbar": "bg:#111a2e #b8c4e0 noreverse",
+            "toolbar": "bg:#111a2e #b8c4e0 noreverse",
+            "toolbar.mode": "bg:#111a2e #8aa4ff bold noreverse",
+            "toolbar.mode.default": "bg:#111a2e #8aa4ff bold noreverse",
+            "toolbar.mode.accept": "bg:#111a2e #c084fc bold noreverse",
+            "toolbar.mode.plan": "bg:#111a2e #fbbf24 bold noreverse",
+            "toolbar.mode.auto": "bg:#111a2e #4ade80 bold noreverse",
+            "toolbar.mode.dontask": "bg:#111a2e #fb7185 bold noreverse",
+            "toolbar.hint": "bg:#111a2e #8494b4 noreverse",
+            "work.label": f"{ACCENT_LIGHT} bold",
+            "work.note": ACCENT_SOFT,
+            "work.detail": MUTED,
+            "completion-menu": "bg:#0b1224 #c7d2fe",
+            "completion-border": "bg:#0b1224 #2f4478",
+            "completion-menu.completion": "bg:#0b1224 #8aa4ff",
+            "completion-menu.completion.current": "bg:#0b1224 #e0e7ff bold noreverse",
+            "completion-menu.meta.completion": "bg:#0b1224 #8494b4",
+            "completion-menu.meta.completion.current": "bg:#0b1224 #c7d2fe noreverse",
+            "completion-menu.multi-column-meta": "bg:#0b1224 #8494b4",
+            "scrollbar.background": "bg:#0b1224",
+            "scrollbar.button": "bg:#3b5bdb",
+        })
 
     from prompt_toolkit.styles import DynamicStyle
     prompt = PromptSession(
@@ -297,6 +399,8 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
         reserve_space_for_menu=3,
         input=terminal_input, output=terminal_output,
     )
+
+    install_bordered_completion_menu(prompt)
 
     def pending_request():
         return next((item for item in pending if not item["future"].done()), None)
@@ -357,7 +461,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
             except Exception as error:
                 if event.get("future") and not event["future"].done():
                     event["future"].set_result(False if event["type"] == "approval" else "无法展示问题。")
-                renderer.console.print(Text(str(error), style="red"))
+                renderer.console.print(Text(str(error), style=ERROR))
             finally:
                 events.task_done()
                 prompt.app.invalidate()
@@ -369,7 +473,8 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
             renderer.started = submitted
             prompt.app.invalidate()
             try:
-                await print_above(lambda: renderer.console.print(Text("❯ " + safe_text(text), style="bold")))
+                await print_above(lambda: renderer.console.print(Text.assemble(
+                    ("❯ ", f"bold {ACCENT}"), (safe_text(text), "bold"))))
                 if work.cancelling:
                     continue
                 from .commands import expand_references
@@ -378,7 +483,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                                         authorization_prompt=text if authorization_prompt is None else authorization_prompt)
                 )
             except (Exception, KeyboardInterrupt) as error:
-                await print_above(lambda error=error: renderer.console.print(Text(str(error) or "已取消。", style="red")))
+                await print_above(lambda error=error: renderer.console.print(Text(str(error) or "已取消。", style=ERROR)))
             finally:
                 await events.join()
                 work.stop()
@@ -451,13 +556,13 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                                 if isinstance(reply, str) and reply:
                                     enqueue(reply, authorization_prompt=command)
                             except (Exception, KeyboardInterrupt) as error:
-                                renderer.console.print(Text(str(error) or "已取消。", style="red"))
+                                renderer.console.print(Text(str(error) or "已取消。", style=ERROR))
                             finally:
                                 command_running = False
                         command_task = asyncio.create_task(run_command(text, work.active or not prompts.empty()))
                         await asyncio.sleep(0)
                     except Exception as error:
-                        renderer.console.print(Text(str(error), style="red"))
+                        renderer.console.print(Text(str(error), style=ERROR))
                 else:
                     if command_running:
                         renderer.console.print("命令处理中，请稍候。")

@@ -12,7 +12,7 @@ from .mascot import pixel_cells
 # One-cell-high thumbnail of Items_54.png. The mouthpiece sits above the bell.
 _TRUMPET = ("OA.", ".AA")
 _TRUMPET_TILT = ("OAA", ".AA")
-_PALETTE = {"O": "#f87722", "A": "#ffad34"}
+_PALETTE = {"O": "#263a7a", "A": "#5b7cfa"}
 _FRAME_INTERVAL = 0.25
 _NOTES = ("♪", "♫", "♪", "·", " ", " ")
 _BUBBLES = (".", "∘", "°", "°", "·", " ")
@@ -44,10 +44,10 @@ def potion_frame(frame, color):
     """Draw the Items_7.png bottle with a rippling purple surface and rising bubble."""
     # The narrower neck and pale glass shoulders preserve the silhouette in one row.
     return (
-        ("#c0ccdc" if color else "", "▅"),
-        ("#d482ff bg:#ffffff" if color else "", _LIQUID_LEVELS[frame] if color else "█"),
-        ("#ffffff" if color else "", "▅"),
-        ("#d482ff" if color else "", _BUBBLES[frame]),
+        ("#c7d2e8" if color else "", "▅"),
+        ("#5b7cfa bg:#eef2ff" if color else "", _LIQUID_LEVELS[frame] if color else "█"),
+        ("#eef2ff" if color else "", "▅"),
+        ("#8aa4ff" if color else "", _BUBBLES[frame]),
     )
 
 

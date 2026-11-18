@@ -9,6 +9,7 @@ from pathlib import Path
 
 from rich import box
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -109,10 +110,16 @@ def execute_command(session, line, renderer, *, console=None, running=False):
     out = renderer.console if console is None else console
     session._activate()
     if command == "/help":
-        table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        light = session.config.data["theme"] == "light"
+        background = "#f4f7ff" if light else "#0b1224"
+        detail_style = "#5b6b85" if light else "#8494b4"
+        out.print(Rule("命令", style=ACCENT))
+        table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2), expand=False,
+                      style=f"on {background}")
         for name, detail in COMMANDS.items():
-            table.add_row(Text(name, style=ACCENT), Text(detail))
+            table.add_row(Text(name, style=ACCENT), Text(detail, style=detail_style))
         out.print(table)
+        out.print(Rule(style=ACCENT))
     elif command == "/clear":
         session.new()
         out.print("已保存旧会话并开始新会话。")

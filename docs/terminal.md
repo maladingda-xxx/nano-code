@@ -35,7 +35,7 @@ nano-code doctor
 | 模型 | `/model` 查看当前模型和候选项，`/model <ID>` 在当前服务内切换。输入 `/model ` 后可补全候选。用户设置中的 `models` 是可补全的模型 ID 列表。 |
 | 上下文 | `/context` 分别显示消息、工具与协议开销、回复预留和剩余输入空间的 token 估算。`/compact [重点]` 生成摘要，报告压缩前后用量，并给出可用 `/resume` 打开的原对话归档 ID。`/cost` 查看服务端用量，`/export` 导出对话。 |
 | 推理强度 | 直连官方 DeepSeek 且模型为 `deepseek-flash` 或 `deepseek-v4-pro` 时，`/effort` 显示级别，`/effort low`、`/effort high`、`/effort max` 切换。`/effort auto` 恢复适配器默认。启动时也可传 `--effort` 或设置 `REASONING_EFFORT`。 |
-| 权限模式 | `/plan` 进入只读计划，再输入一次会返回先前模式。`/auto` 开关自动模式，`/permissions` 查看或指定模式。Shift+Tab 在默认、接受编辑、计划和自动模式之间循环。 |
+| 权限模式 | `/plan` 进入只读计划，再输入一次会返回先前模式。`/auto` 开关自动模式，`/permissions` 查看或指定模式。Shift+Tab 在默认、接受编辑、计划和自动模式之间循环，运行中也可以切换，新模式影响后续工具调用。底部状态行显示当前模式，例如 `⏵⏵ auto mode on (shift+tab to cycle)`；`dontAsk` 不参与循环，用 `/permissions` 切换。 |
 | 项目约定 | 启动时读取 `CLAUDE.md` 和 `AGENTS.md`，访问不同子目录的文件时读取相应约定。`/init` 生成项目模板，`/memory` 维护项目记忆。 |
 
 恢复时会检查文件是否仍与 Nano Code 当时写入的内容一致，发现冲突会保留当前文件。可恢复范围包括通过 `edit_file` 和 `write_file` 完成的修改。测试命令、MCP 工具和 hooks 造成的外部变更需要用 Git 或对应系统的记录审阅。对话分支共用项目文件。需要独立修改文件时，请从两个 Git worktree 分别启动。

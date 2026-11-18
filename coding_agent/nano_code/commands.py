@@ -10,7 +10,6 @@ from pathlib import Path
 from rich import box
 from rich.panel import Panel
 from rich.rule import Rule
-from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
@@ -23,6 +22,7 @@ from workspace import workspace_path
 
 from . import __version__, sessions
 from .config import MODES
+from .diff_view import files_text, parse_diff, totals
 from .extensions import expand_skill
 from .providers import effort_levels
 
@@ -127,7 +127,18 @@ def execute_command(session, line, renderer, *, console=None, running=False):
         out.print(Text(session.git(["status", "--short", "--branch"])))
         out.print(Text(f"{session.uid} · {session.config.data['provider']} / {session.config.data['model']} · {session.permissions.mode}"))
     elif command == "/diff":
-        out.print(Syntax(safe_text(session.git_diff(argument == "--staged")), "diff", theme="ansi_dark", word_wrap=True))
+        text = safe_text(session.git_diff(argument == "--staged"))
+        files = parse_diff(text)
+        if files:
+            added, removed = totals(files)
+            out.print(Rule(f"Git diff  +{added} -{removed}", style=ACCENT))
+            body, _, _ = files_text(
+                files, indent="", show_headers=True, width=out.width,
+                light=session.config.data.get("theme") == "light",
+            )
+            out.print(body)
+        else:
+            out.print(Text(text))
     elif command == "/output":
         renderer.show_output(out)
     elif command == "/sessions":
@@ -283,6 +294,7 @@ def execute_command(session, line, renderer, *, console=None, running=False):
         if argument not in {"dark", "light"}:
             raise ValueError("用法：/theme dark 或 /theme light")
         session.config.data["theme"] = argument
+        renderer.light = argument == "light"
         out.print("主题已切换。")
     elif command == "/trust":
         out.print(Text("项目配置来源：\n" + "\n".join(session.config.sources)))

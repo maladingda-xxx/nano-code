@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from prompt_toolkit.application import create_app_session
 from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
@@ -20,10 +21,13 @@ from nano_code import Session, __version__, sessions
 from nano_code.cli import main
 from nano_code.commands import diagnostics, execute_command, redact
 from nano_code.config import Config, write_json
+from nano_code.diff_view import files_text, parse_diff, totals
+from nano_code.effort_picker import effort_color, pick_effort
 from nano_code.mcp_client import MCPClient
+from nano_code.model_picker import model_picker_text, pick_model
 from nano_code.providers import AnthropicModel
 from nano_code.rpc import serve
-from nano_code.ui import InputCompleter, interactive
+from nano_code.ui import InputCompleter, Renderer, interactive
 
 
 @pytest.fixture
@@ -476,6 +480,108 @@ def test_terminal_accepts_prompt_approval_and_exit(project):
             assert (project / "result.txt").read_text(encoding="utf-8") == "ok"
 
     asyncio.run(exercise())
+
+
+def test_model_picker_marks_current_model(project):
+    config = Config(project, overrides={"base_url": "https://example.test", "model": "m1", "models": ["m2"]})
+    with Session(project, config=config) as session:
+        text = "".join(fragment[1] for fragment in model_picker_text(session, 0))
+    assert "1. m1" in text and "2. m2" in text
+    assert "当前模型" in text and "✓" in text
+
+
+def test_model_picker_selects_with_number(project):
+    config = Config(project, overrides={"base_url": "https://example.test", "model": "m1", "models": ["m2"]})
+
+    async def exercise():
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()), Session(project, config=config) as session:
+            task = asyncio.create_task(pick_model(session))
+            await asyncio.sleep(0.1)
+            pipe.send_text("2")
+            await asyncio.sleep(0.05)
+            pipe.send_text("\r")
+            return await asyncio.wait_for(task, 3)
+
+    assert asyncio.run(exercise()) == {"model": "m2", "effort": "auto"}
+
+
+def test_model_picker_adjusts_effort_with_arrows(project):
+    config = Config(project, overrides={"base_url": "https://api.deepseek.com",
+                                        "model": "deepseek-flash", "models": ["deepseek-v4-pro"]})
+
+    async def exercise():
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()), Session(project, config=config) as session:
+            task = asyncio.create_task(pick_model(session))
+            await asyncio.sleep(0.1)
+            pipe.send_text("\x1b[C")
+            await asyncio.sleep(0.05)
+            pipe.send_text("\r")
+            return await asyncio.wait_for(task, 3)
+
+    assert asyncio.run(exercise()) == {"model": "deepseek-flash", "effort": "low"}
+
+
+def test_effort_colors_and_animated_max():
+    assert effort_color("auto") == "#fbbf24"
+    assert effort_color("low") == "#4ade80"
+    assert effort_color("high") == "#c084fc"
+    assert effort_color("max", now=0) != effort_color("max", now=0.1)
+
+
+def test_effort_picker_selects_with_arrow(project):
+    config = Config(project, overrides={"base_url": "https://api.deepseek.com", "model": "deepseek-flash"})
+
+    async def exercise():
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()), Session(project, config=config) as session:
+            task = asyncio.create_task(pick_effort(session))
+            await asyncio.sleep(0.1)
+            pipe.send_text("\x1b[C")
+            await asyncio.sleep(0.05)
+            pipe.send_text("\r")
+            return await asyncio.wait_for(task, 3)
+
+    assert asyncio.run(exercise()) == "low"
+
+
+def test_parse_diff_reports_per_file_stats_and_creation():
+    text = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,3 +1,4 @@\n one\n-old\n+new\n+extra\n three\n"
+        "diff --git a/b.py b/b.py\nnew file mode 100644\n--- /dev/null\n+++ b/b.py\n"
+        "@@ -0,0 +1,2 @@\n+x\n+y\n"
+    )
+    files = parse_diff(text)
+    assert [(item.path, item.created, item.added, item.removed) for item in files] == [
+        ("a.py", False, 2, 1),
+        ("b.py", True, 2, 0),
+    ]
+    assert totals(files) == (4, 1)
+
+
+def test_diff_text_marks_added_rows_full_width_with_syntax_colors():
+    files = parse_diff("--- a/a.py\n+++ b/a.py\n@@ -1,2 +1,2 @@\n-old\n+return 1\n keep\n")
+    body, shown, total = files_text(files, light=False, indent="", width=40)
+    assert "1 -old" in body.plain and "1 +return 1" in body.plain and "2  keep" in body.plain
+    assert any("on #0f2a1c" in str(span.style) for span in body.spans)
+    assert any("#c678dd" in str(span.style) for span in body.spans)  # one-dark keyword
+    added_row = next(line for line in body.plain.splitlines() if "+return" in line)
+    assert len(added_row) == 40
+    limited, shown, total = files_text(files, light=False, indent="", max_lines=1)
+    assert shown == 1 and total == 4 and limited.plain.count("\n") == 0
+
+
+def test_renderer_prints_edit_diff_with_file_header_and_colors():
+    output = io.StringIO()
+    renderer = Renderer(Console(file=output, force_terminal=True, color_system="truecolor", width=100))
+    renderer.event({
+        "type": "tool_result",
+        "call": {"function": {"name": "edit_file", "arguments": "{}"}},
+        "result": "已编辑 sample.py\n--- a/sample.py\n+++ b/sample.py\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n",
+        "outcome": {"status": "ok"},
+    })
+    rendered = output.getvalue()
+    assert "Update(sample.py)" in rendered and "+1 -1" in rendered
+    assert "48;2;15;42;28" in rendered  # added-row background
 
 
 def test_mode_change_can_be_forced_while_busy(project):

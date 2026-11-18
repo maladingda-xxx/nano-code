@@ -29,14 +29,16 @@ nano-code doctor
 | 输入和补全 | Enter 发送，Alt+Enter 或行尾 `\` 后按 Enter 换行。上下键查看历史，`/` 补全命令，`@路径` 附带文件。含空格路径用 `@"目录/文件名"`。 |
 | 运行中的控制 | 可以继续输入，消息按顺序执行。`/queue` 查看队列，`/clear-queue` 清空。Ctrl+C 或 `/cancel` 请求取消当前轮。模型请求等待服务商响应时，取消可能要等到响应或超时。 |
 | 实时状态 | 小号 `composing···` 和药水瓶 `brewing···` 按轮交替，每轮固定一种动画。耗时从提交时开始。`↓` 只显示服务商已报告的输出 token，未报告时显示 `—`。等待授权时显示授权提示。 |
-| 审阅 | `/status` 查看 Git 状态，`/diff` 查看工作区差异，`/diff --staged` 查看暂存差异。`/output` 展开最近一轮工具输出，Ctrl+O 切换展开模式。 |
+| 审阅 | `/status` 查看 Git 状态，`/diff` 查看工作区差异，`/diff --staged` 查看暂存差异。编辑文件后直接显示 `Update(路径) +N -M` 和整行背景色的改动块，超过 12 行时提示展开。`/output` 展开最近一轮工具输出，Ctrl+O 切换展开模式。 |
 | 会话 | `/sessions` 列表，`/resume <名称或 ID>` 恢复，`/rename` 重命名，`/fork` 复制对话。命令行支持 `--continue` 和 `--resume <ID>`。 |
 | 恢复 | `/undo` 回退当前会话的最近一次内置文件编辑。`/checkpoints <轮次 ID>` 预览，`/restore <轮次 ID>` 恢复该轮次。`/recover` 列出异常中断的轮次。 |
-| 模型 | `/model` 查看当前模型和候选项，`/model <ID>` 在当前服务内切换。输入 `/model ` 后可补全候选。用户设置中的 `models` 是可补全的模型 ID 列表。 |
+| 模型 | `/model` 打开内嵌选择对话框：↑/↓ 或数字选择，←/→ 调整该模型的推理强度，Enter 同时应用模型和强度，Esc 取消；`/model <ID>` 直接切换。输入 `/model ` 后可补全候选。用户设置中的 `models` 是可补全的模型 ID 列表。 |
 | 上下文 | `/context` 分别显示消息、工具与协议开销、回复预留和剩余输入空间的 token 估算。`/compact [重点]` 生成摘要，报告压缩前后用量，并给出可用 `/resume` 打开的原对话归档 ID。`/cost` 查看服务端用量，`/export` 导出对话。 |
-| 推理强度 | 直连官方 DeepSeek 且模型为 `deepseek-flash` 或 `deepseek-v4-pro` 时，`/effort` 显示级别，`/effort low`、`/effort high`、`/effort max` 切换。`/effort auto` 恢复适配器默认。启动时也可传 `--effort` 或设置 `REASONING_EFFORT`。 |
+| 推理强度 | 直连官方 DeepSeek 且模型为 `deepseek-flash` 或 `deepseek-v4-pro` 时，`/effort` 打开横向滑轨对话框，`←/→` 调整，Enter 应用；auto 为黄色、low 为绿色、high 为紫色、max 为动态炫彩。`/effort low`、`/effort high`、`/effort max` 可直接切换，`/effort auto` 恢复适配器默认。启动时也可传 `--effort` 或设置 `REASONING_EFFORT`。 |
 | 权限模式 | `/plan` 进入只读计划，再输入一次会返回先前模式。`/auto` 开关自动模式，`/permissions` 查看或指定模式。Shift+Tab 在默认、接受编辑、计划和自动模式之间循环，运行中也可以切换，新模式影响后续工具调用。底部状态行显示当前模式，例如 `⏵⏵ auto mode on (shift+tab to cycle)`；`dontAsk` 不参与循环，用 `/permissions` 切换。 |
 | 项目约定 | 启动时读取 `CLAUDE.md` 和 `AGENTS.md`，访问不同子目录的文件时读取相应约定。`/init` 生成项目模板，`/memory` 维护项目记忆。 |
+
+内置的 `edit_file` 和 `write_file` 执行后会在终端显示统一 diff：按文件分组的 `Update(路径)`（新建文件显示 `Create`）标题、`+新增 -删除` 行数，以及整行铺满终端宽度的绿色新增行和红色删除行背景。代码保留语法高亮，新增和删除行带新旧行号。默认最多显示 12 行，其余用 `/output` 展开；`/diff` 使用同一套渲染，按文件显示标题和统计。
 
 恢复时会检查文件是否仍与 Nano Code 当时写入的内容一致，发现冲突会保留当前文件。可恢复范围包括通过 `edit_file` 和 `write_file` 完成的修改。测试命令、MCP 工具和 hooks 造成的外部变更需要用 Git 或对应系统的记录审阅。对话分支共用项目文件。需要独立修改文件时，请从两个 Git worktree 分别启动。
 

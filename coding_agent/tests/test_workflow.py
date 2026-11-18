@@ -370,6 +370,18 @@ def test_diff_shows_change_to_final_newline(workspace):
     assert "-text\n\\ No newline at end of file\n+text" in diff
 
 
+def test_write_file_reports_a_diff(workspace):
+    created = tools.write_file("new.txt", "hello\n")
+    assert "已写入 new.txt" in created
+    assert "--- /dev/null" in created and "+++ b/new.txt" in created and "+hello" in created
+
+    updated = tools.write_file("new.txt", "changed\n")
+    assert "-hello" in updated and "+changed" in updated
+
+    same = tools.write_file("new.txt", "changed\n")
+    assert "已写入 new.txt" in same and "---" not in same
+
+
 @pytest.mark.parametrize("finish_reason", ["tool_calls", None])
 def test_streaming_text_with_tools_and_incomplete_calls(finish_reason):
     function = SimpleNamespace(name="read_file", arguments='{"file_path":"a.txt"}')

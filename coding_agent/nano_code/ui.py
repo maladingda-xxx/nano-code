@@ -30,7 +30,10 @@ from rich.text import Text
 from context_budget import estimate_tokens
 from . import __version__
 from .config import MODES, MODE_CYCLE
+from .diff_view import file_title, files_text, parse_diff, totals
+from .effort_picker import pick_effort
 from .mascot import mascot
+from .model_picker import effort_choices, pick_model
 from .providers import effort_levels
 from .work_status import WorkStatus
 
@@ -44,6 +47,7 @@ SUCCESS = "#2f9e82"
 WARNING = "#c98a2e"
 ERROR = "#d05c68"
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+INLINE_DIFF_LINES = 12
 COMMANDS = {
     "/help": "命令与快捷键", "/clear": "保存当前会话并开始新会话", "/exit": "保存并退出",
     "/status": "项目、模型与运行状态", "/diff": "审阅 Git 差异（--staged 查看暂存）",
@@ -136,8 +140,10 @@ class Renderer:
         self.stream_tail = ""
         self.output = []
         self.started = time.monotonic()
+        self.light = False
 
     def welcome(self, session):
+        self.light = session.config.data.get("theme") == "light"
         title = Text.assemble(("Nano Code", f"bold {ACCENT}"), (f" v{__version__}", "dim"))
         details = Group(
             title,
@@ -188,7 +194,21 @@ class Renderer:
             self.output.append(event)
             content = safe_text(event["result"])
             status = event["outcome"]["status"]
-            if self.expanded:
+            name = event["call"]["function"]["name"]
+            files = parse_diff(content) if name in {"edit_file", "write_file"} else []
+            if files:
+                added, removed = totals(files)
+                head = Text("  ⎿  " + " · ".join(file_title(item) for item in files), style=ACCENT if status == "ok" else WARNING)
+                head.append(f"  +{added} -{removed}", style=SUCCESS if status == "ok" else WARNING)
+                self.console.print(head)
+                body, shown, total = files_text(
+                    files, light=self.light, indent="     ", width=self.console.width,
+                    max_lines=None if self.expanded else INLINE_DIFF_LINES,
+                )
+                self.console.print(body)
+                if total > shown:
+                    self.console.print(Text(f"     … 还有 {total - shown} 行 · /output 展开", style="dim"))
+            elif self.expanded:
                 self.console.print(Text(content, style="dim" if status == "ok" else WARNING))
             else:
                 lines = content.splitlines()
@@ -216,9 +236,17 @@ class Renderer:
         console = self.console if console is None else console
         for event in self.output:
             name = event["call"]["function"]["name"]
-            console.print(Rule(name, style=ACCENT))
             text = safe_text(event["result"])
-            console.print(Syntax(text, "diff", theme="ansi_dark", word_wrap=True) if name == "edit_file" else Text(text))
+            files = parse_diff(text) if name in {"edit_file", "write_file"} else []
+            if files:
+                added, removed = totals(files)
+                title = file_title(files[0]) if len(files) == 1 else f"{len(files)} 个文件"
+                console.print(Rule(f"{title}  +{added} -{removed}", style=ACCENT))
+                body, _, _ = files_text(files, light=self.light, indent="", width=console.width)
+                console.print(body)
+            else:
+                console.print(Rule(name, style=ACCENT))
+                console.print(Syntax(text, "diff", theme="ansi_dark", word_wrap=True) if name == "edit_file" else Text(text))
         if not self.output:
             console.print("暂无工具输出。")
 
@@ -540,6 +568,39 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                     while not prompts.empty():
                         prompts.get_nowait()
                         prompts.task_done()
+                    continue
+                if text == "/model":
+                    if session.busy or work.active or command_running or not prompts.empty():
+                        renderer.console.print(Text("运行中或队列未清空时不能切换模型。", style=WARNING))
+                        continue
+                    size = prompt.app.output.get_size()
+                    choice = await pick_model(session, width=size.columns, height=size.rows)
+                    if choice:
+                        try:
+                            session.set_model(choice["model"])
+                            session.set_effort(choice["effort"])
+                            renderer.console.print(Text(
+                                f"模型：{choice['model']} · 推理强度：{choice['effort']}。", style=ACCENT))
+                        except Exception as error:
+                            renderer.console.print(Text(str(error), style=ERROR))
+                    continue
+                if text == "/effort":
+                    if session.busy or work.active or command_running or not prompts.empty():
+                        renderer.console.print(Text("运行中或队列未清空时不能切换推理强度。", style=WARNING))
+                        continue
+                    levels = effort_choices(session, session.config.data["model"])
+                    if len(levels) <= 1:
+                        renderer.console.print(Text(
+                            f"{session.config.data['model']} 在当前 API 环境下没有可切换的推理强度。"))
+                        continue
+                    size = prompt.app.output.get_size()
+                    effort = await pick_effort(session, width=size.columns)
+                    if effort:
+                        try:
+                            session.set_effort(effort)
+                            renderer.console.print(Text(f"推理强度：{effort}。", style=ACCENT))
+                        except Exception as error:
+                            renderer.console.print(Text(str(error), style=ERROR))
                     continue
                 if text.startswith("/"):
                     try:

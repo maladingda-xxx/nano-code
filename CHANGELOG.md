@@ -8,6 +8,15 @@
 - 兼容 v0.3 存档布局；本轮不提供自动迁移
 - 可通过 `nano-code doctor` 的 `session_format` 字段或 `nano-code doctor --export` 查看
 
+## 未发布
+
+### 改进
+
+- 终端配色统一为 midnight blue，补全菜单、底部模式行和模型、推理强度对话框同步调整
+- 编辑文件后直接显示 diff：按文件显示 `Update`/`Create` 标题、`+N -M` 统计，以及整行背景、带行号和语法高亮的增删行
+- `write_file` 返回改动 diff，与 `edit_file` 一致，便于模型和用户审阅
+- `/diff` 使用同一套 diff 渲染
+
 ## 0.6.0 · 2026-11-18
 
 ### 新增

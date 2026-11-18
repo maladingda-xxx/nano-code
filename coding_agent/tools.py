@@ -316,16 +316,27 @@ def search_workspace(query: str, dir_path: str = ".", limit: int = 30) -> str:
     return "\n".join(matches) if matches else f"未找到匹配: {query}"
 
 
-def _edit_diff(path: Path, before: str, after: str) -> str:
+_DIFF_LINE_LIMIT = 240
+
+
+def _edit_diff(path: Path, before: str | None, after: str) -> str:
+    """Build a unified diff; before=None marks a newly created file."""
     name = path.relative_to(_workspace_root).as_posix()
     lines = difflib.unified_diff(
-        before.splitlines(keepends=True), after.splitlines(keepends=True), f"a/{name}", f"b/{name}",
+        [] if before is None else before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        "/dev/null" if before is None else f"a/{name}", f"b/{name}",
     )
-    return "\n".join(
+    diff = "\n".join(
         line.rstrip("\r\n") if line.endswith(("\r", "\n")) else
         line + "\n\\ No newline at end of file"
         for line in lines
     )
+    rows = diff.splitlines()
+    if len(rows) > _DIFF_LINE_LIMIT:
+        rows = rows[:_DIFF_LINE_LIMIT] + [f"… diff 已截断（共 {len(rows)} 行）"]
+        diff = "\n".join(rows)
+    return diff
 
 
 def edit_file(file_path: str, old_text: str, new_text: str) -> str:
@@ -462,7 +473,15 @@ def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
     if mode == "append" and before is not None:
         data = before + data
     record_edit(_workspace_root, path, before, data, tool)
-    return f"已写入 {path.relative_to(_workspace_root).as_posix()}（{len(data)} 字节）"
+    summary = f"已写入 {path.relative_to(_workspace_root).as_posix()}（{len(data)} 字节）"
+    before_text, readable = None, True
+    if before is not None:
+        try:
+            before_text = before.decode("utf-8")
+        except UnicodeDecodeError:
+            readable = False
+    diff = _edit_diff(path, before_text, data.decode("utf-8")) if readable else ""
+    return f"{summary}\n{diff}".rstrip() if diff else summary
 
 
 # ============================================================

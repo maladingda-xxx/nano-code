@@ -45,12 +45,12 @@ nano-code doctor
 - `default` 允许仓库内读取。编辑、外部命令和 MCP 调用需要确认。可按 `y` 允许一次，或按 `s` 在当前会话允许完全相同的操作。
 - `acceptEdits` 接受仓库范围内的内置文件编辑。外部命令和 MCP 调用仍有各自的授权检查。
 - `plan` 允许只读调查，关闭编辑、外部命令、MCP 工具和可执行 hooks。工作区写入类命令如 `/undo`、`/restore <ID>` 和 `/export` 也需先退出计划模式。
-- `auto` 自动允许工作区内置编辑和 `permissions.autoAllow` 中完全匹配工作目录和参数的命令。其他操作按现有授权流程处理。该模式使用本地规则。
+- `auto` 用独立模型请求审查本轮任务提出的编辑和命令，给出允许或拒绝。只有允许时才执行，拒绝、超预算或无法取得有效结论时拦截。终端显示 `Auto 审查` 结果，自动审查计入当前模型的请求数和 token 用量。MCP 等其他外部工具需要已有的明确允许规则。
 - `dontAsk` 禁用交互授权。外部操作必须有显式允许规则。`deny` 优先于 `allow`。权限控制在工具层，已授权外部程序仍以当前用户权限运行。
 
 可在用户或受信任的项目设置中配置确切的参数、目录和文件规则。例如 `{"permissions":{"allow":[{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}],"deny":[{"tool":"write_file","path":"deploy/*"}]}}`。项目中的可执行扩展和允许规则需要先使用 `/trust` 绑定当前配置，然后重启。内容修改后需要重新信任。
 
-如需只在自动模式预先批准一条测试命令，可在 `permissions.autoAllow` 中加入 `{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}`。也可以用 `nano-code --permission-mode auto` 启动。
+可用 `nano-code --permission-mode auto` 启动，或在已有会话输入 `/auto`。自动审查可直接处理任务中的常规本地测试。对特定命令可在 `permissions.autoAllow` 中添加精确规则，例如 `{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}`，命中时直接放行。显式 `deny` 优先。
 
 项目 `.nano/skills/<名称>/SKILL.md`、`.claude/skills/<名称>/SKILL.md` 或用户 `~/.nano-code/skills/<名称>/SKILL.md` 可以放可复用流程。`/skills` 查看，`/<名称> 参数` 手动调用。工具可按需加载允许模型调用的 Skill。子代理支持同样位置下的 `agents/<名称>.md`，它们用独立上下文做前台只读调查并返回结果。
 

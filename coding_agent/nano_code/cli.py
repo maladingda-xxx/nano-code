@@ -105,8 +105,7 @@ def main(argv=None):
                 return asyncio.run(interactive(session, text))
             if text is None or not text.strip():
                 parser.error("Non-interactive mode requires -p PROMPT or --rpc")
-            from .commands import expand_references
-            return print_turn(session, expand_references(session, text), output, errors)
+            return print_turn(session, text, output, errors)
     except KeyboardInterrupt:
         return 130
     except Exception as error:
@@ -118,6 +117,8 @@ def main(argv=None):
 
 
 def print_turn(session, prompt, output, errors):
+    from .commands import expand_references
+
     reply = None
 
     def emit(event):
@@ -130,7 +131,7 @@ def print_turn(session, prompt, output, errors):
             errors.print(Text(event["text"], style="red"))
 
     session.events = emit
-    result = session.run(prompt)
+    result = session.run(expand_references(session, prompt), authorization_prompt=prompt)
     if output == "json":
         print(json.dumps({**result, "result": reply, "usage": session.usage}, ensure_ascii=True))
     elif output == "text" and reply:

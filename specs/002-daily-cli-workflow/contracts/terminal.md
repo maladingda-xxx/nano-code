@@ -9,4 +9,4 @@
 | `/plan`、`/auto` | 切换对应权限模式。退出计划时回到先前模式。 |
 | `/permissions [模式]`、Shift+Tab | 显示或切换模式。命令行可用 `--permission-mode auto`。 |
 
-`permissions.autoAllow` 接受精确命令规则，例如 `{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}`。这些规则只在自动模式生效。
+未获预授权的工作区编辑和命令进入独立审查。审查请求使用当前配置的模型，拥有单独的上下文，并通过 `notice` 报告 `reason=auto_review` 及结论。未返回有效结论时拒绝执行。`permissions.autoAllow` 接受只在自动模式生效的精确命令规则。

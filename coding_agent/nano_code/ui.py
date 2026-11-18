@@ -197,8 +197,8 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
     closing = False
     command_running = False
 
-    def enqueue(text):
-        prompts.put_nowait((text, time.monotonic()))
+    def enqueue(text, *, authorization_prompt=None):
+        prompts.put_nowait((text, authorization_prompt, time.monotonic()))
 
     def cancel_work():
         session.cancel()
@@ -364,7 +364,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     async def run_prompts():
         while True:
-            text, submitted = await prompts.get()
+            text, authorization_prompt, submitted = await prompts.get()
             work.start(submitted)
             renderer.started = submitted
             prompt.app.invalidate()
@@ -373,7 +373,10 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                 if work.cancelling:
                     continue
                 from .commands import expand_references
-                await asyncio.to_thread(lambda: session.run(expand_references(session, text)))
+                await asyncio.to_thread(
+                    lambda: session.run(expand_references(session, text),
+                                        authorization_prompt=text if authorization_prompt is None else authorization_prompt)
+                )
             except (Exception, KeyboardInterrupt) as error:
                 await print_above(lambda error=error: renderer.console.print(Text(str(error) or "已取消。", style="red")))
             finally:
@@ -446,7 +449,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                                 reply = await asyncio.to_thread(execute_command, session, command, renderer,
                                                                 console=Console(highlight=False), running=running)
                                 if isinstance(reply, str) and reply:
-                                    enqueue(reply)
+                                    enqueue(reply, authorization_prompt=command)
                             except (Exception, KeyboardInterrupt) as error:
                                 renderer.console.print(Text(str(error) or "已取消。", style="red"))
                             finally:

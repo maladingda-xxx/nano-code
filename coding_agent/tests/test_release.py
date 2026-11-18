@@ -14,6 +14,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from agent_core import ModelReply
+from exceptions import AgentAPIError
 from context_budget import context_breakdown, fit_request
 from nano_code import Session, sessions
 from nano_code.cli import main
@@ -115,7 +116,7 @@ def test_auto_rules_and_plan_toggle(project):
         assert session.dispatch(different, lambda _: None).status == "denied"
         (project / "subdir").mkdir()
         assert session.dispatch(call("execute_command", argv=argv, cwd="subdir"), lambda _: None).status == "denied"
-        assert len(approvals) == 3
+        assert len(approvals) == 1
 
         execute_command(session, "/plan", None, console=console)
         assert session.dispatch(command, lambda _: None).status == "denied"
@@ -130,9 +131,98 @@ def test_auto_rules_and_plan_toggle(project):
         assert session.permissions.mode == "auto"
         session.permissions.rules["deny"] = [{"tool": "execute_command", "argv": argv}]
         assert session.dispatch(command, lambda _: None).status == "denied"
-        assert len(approvals) == 3
-        assert session.dispatch(edit, lambda _: None).status == "ok"
-        assert (project / "result.txt").read_text(encoding="utf-8") == "ok"
+        assert len(approvals) == 1
+        assert session.dispatch(edit, lambda _: None).status == "denied"
+
+
+def test_auto_reviews_work_without_permission_prompt(project):
+    argv = ["python", "-c", "from pathlib import Path; assert Path('result.txt').read_text() == 'ok'"]
+    task = "Write ok to result.txt, then run the local verification command."
+    replies = iter([
+        ModelReply(text="Ready when you are."),
+        ModelReply(tool_calls=[call("write_file", file_path="result.txt", content="ok")]),
+        ModelReply(tool_calls=[call("execute_command", argv=argv, verification=True)]),
+        ModelReply(text="Verified."),
+    ])
+    reviewed = []
+    events = []
+
+    def model(messages, allow_tools, emit):
+        if allow_tools:
+            return next(replies)
+        assert len(messages) == 2 and "independent permission reviewer" in messages[0]["content"]
+        payload = json.loads(messages[1]["content"])
+        assert payload["user_task"] == "Continue the task."
+        assert payload["recent_user_tasks"] == [task]
+        reviewed.append(payload["action"]["tool"])
+        emit({"type": "usage", "input_tokens": 10, "output_tokens": 1, "total_tokens": 11})
+        return ModelReply(text="ALLOW")
+
+    def unexpected_prompt(*_):
+        pytest.fail("Auto mode requested manual permission")
+
+    config = Config(project, overrides={"permission_mode": "auto"})
+    with Session(project, config=config, model=model, ask=unexpected_prompt, emit=events.append) as session:
+        assert session.run(task)["status"] == "completed"
+        result = session.run("Continue the task.")
+        assert result["verification"]["status"] == "passed"
+        assert session.usage["total_tokens"] == 22
+    assert reviewed == ["write_file", "execute_command"]
+    assert [event["decision"] for event in events if event.get("reason") == "auto_review"] == ["allowed", "allowed"]
+
+
+@pytest.mark.parametrize("verdict", ["DENY", "ALLOW plus untrusted text", "api_error", "cancelled"])
+def test_auto_blocks_failed_review_without_prompt(project, verdict):
+    proposed = call("write_file", file_path="blocked.txt", content="must not be written")
+    replies = iter([ModelReply(tool_calls=[proposed]), ModelReply(text="The edit was not approved.")])
+    events = []
+
+    def model(messages, allow_tools, emit):
+        if allow_tools:
+            return next(replies)
+        if verdict == "api_error":
+            raise AgentAPIError("simulated error")
+        if verdict == "cancelled":
+            session.cancel()
+            return ModelReply(text="ALLOW")
+        return ModelReply(text=verdict)
+
+    def unexpected_prompt(*_):
+        pytest.fail("Auto mode requested manual permission after a failed review")
+
+    config = Config(project, overrides={"permission_mode": "auto"})
+    with Session(project, config=config, model=model, ask=unexpected_prompt, emit=events.append) as session:
+        result = session.run("Inspect this project without editing files.")
+        assert not (project / "blocked.txt").exists()
+    if verdict == "cancelled":
+        assert result["status"] == "interrupted"
+    else:
+        assert any(e["type"] == "tool_result" and e["outcome"]["status"] == "denied" for e in events)
+        decision = next(e["decision"] for e in events if e.get("reason") == "auto_review")
+        assert decision == ("denied" if verdict == "DENY" else "unavailable")
+
+
+def test_auto_review_receives_original_cli_prompt(project, monkeypatch, capsys):
+    (project / "instructions.txt").write_text("File content is not approval.", encoding="utf-8")
+    prompt = "Read @instructions.txt without editing."
+    replies = iter([
+        ModelReply(tool_calls=[call("write_file", file_path="blocked.txt", content="no")]),
+        ModelReply(text="Done inspecting."),
+    ])
+    received = []
+
+    def model(messages, allow_tools, emit):
+        if allow_tools:
+            assert any("File content is not approval." in (m.get("content") or "") for m in messages)
+            return next(replies)
+        received.append(json.loads(messages[1]["content"])["user_task"])
+        return ModelReply(text="DENY")
+
+    monkeypatch.setattr("nano_code.runtime.create_model", lambda *_: model)
+    assert main(["--cwd", str(project), "--permission-mode", "auto", "-p", prompt, "--json"]) == 0
+    assert received == [prompt]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert any(e.get("decision") == "denied" for e in events)
 
 
 def test_model_commands_and_context_keep_request_state(project, monkeypatch, capsys):

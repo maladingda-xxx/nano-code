@@ -119,8 +119,14 @@ def export_session(uid, messages, path):
     if path.exists():
         raise ValueError("导出文件已存在，请使用新文件名。")
     if path.suffix == ".json":
-        public_messages = [{key: value for key, value in message.items() if key != "reasoning_content"}
+        from agent_core import public_tool_call
+
+        public_messages = [{key: value for key, value in message.items()
+                            if key != "reasoning_content" and not key.startswith("_")}
                            for message in messages]
+        for message in public_messages:
+            if calls := message.get("tool_calls"):
+                message["tool_calls"] = [public_tool_call(call) for call in calls]
         text = json.dumps({"schema_version": 1, "session_id": uid, "messages": public_messages}, ensure_ascii=False, indent=2)
     else:
         text = f"# Nano Code session {uid}\n\n" + "\n\n".join(

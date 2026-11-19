@@ -32,9 +32,10 @@ from . import __version__
 from .config import MODES, MODE_CYCLE
 from .diff_view import file_title, files_text, parse_diff, totals
 from .effort_picker import pick_effort
+from .login_picker import configure_provider
 from .mascot import mascot
 from .model_picker import effort_choices, pick_model
-from .providers import effort_levels
+from .reasoning import CATALOG_EFFORT_PROVIDERS
 from .work_status import WorkStatus
 
 ACCENT = "#5b7cfa"
@@ -56,6 +57,7 @@ COMMANDS = {
     "/undo": "撤销当前会话最近一次内置编辑", "/rewind": "列出文件检查点",
     "/checkpoints": "列出或预览检查点", "/restore": "恢复指定轮次的文件",
     "/recover": "查看或恢复异常退出的轮次", "/model": "查看或切换模型",
+    "/login": "配置模型供应商的账号或 API Key",
     "/effort": "查看或切换受支持模型的推理强度",
     "/permissions": "查看或切换权限模式", "/plan": "切换只读计划模式", "/auto": "切换自动模式",
     "/context": "查看上下文占用", "/compact": "生成摘要并保留原始存档",
@@ -71,6 +73,16 @@ COMMANDS = {
 def safe_text(value):
     value = ANSI.sub("", str(value))
     return "".join(c for c in value if c in "\n\t" or ord(c) >= 32 and ord(c) != 127)
+
+
+def is_login_command(value):
+    return value.split(maxsplit=1)[:1] == ["/login"]
+
+
+class PromptHistory(FileHistory):
+    def append_string(self, string):
+        if not is_login_command(string) or string.strip() == "/login":
+            super().append_string(string)
 
 
 class InputCompleter(Completer):
@@ -90,7 +102,7 @@ class InputCompleter(Completer):
                 prefix = argument.lstrip()
                 choices = {
                     "/model": self.session.model_choices(),
-                    "/effort": ("auto", *effort_levels(self.session.config.data)),
+                    "/effort": self.session.model_efforts(self.session.current_model_choice),
                     "/permissions": MODES,
                 }[command]
                 for choice in choices:
@@ -363,7 +375,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     try:
         session.config.home.mkdir(parents=True, exist_ok=True)
-        history = FileHistory(str(session.config.home / "history"))
+        history = PromptHistory(str(session.config.home / "history"))
     except OSError:
         history = InMemoryHistory()
     def theme():
@@ -522,13 +534,16 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     consumer = asyncio.create_task(consume_events())
     worker = asyncio.create_task(run_prompts())
-    if initial:
+    if initial and not is_login_command(initial):
         enqueue(initial)
     try:
         with create_app_session(input=terminal_input, output=terminal_output), patch_stdout(raw=True):
             while not closing:
                 try:
-                    text = (await prompt.prompt_async([("class:prompt", "❯ ")])).strip()
+                    if initial and is_login_command(initial):
+                        text, initial = initial.strip(), None
+                    else:
+                        text = (await prompt.prompt_async([("class:prompt", "❯ ")])).strip()
                 except KeyboardInterrupt:
                     pending_copy = list(pending)
                     pending.clear()
@@ -569,10 +584,33 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                         prompts.get_nowait()
                         prompts.task_done()
                     continue
-                if text == "/model":
-                    if session.busy or work.active or command_running or not prompts.empty():
+                if is_login_command(text):
+                    if text != "/login":
+                        renderer.console.print(Text("请单独输入 /login，然后在隐藏输入框中填写凭据。", style=WARNING))
+                    elif session.busy or work.active or command_running or not prompts.empty():
+                        renderer.console.print(Text("运行中或队列未清空时不能配置供应商。", style=WARNING))
+                    else:
+                        try:
+                            result = await configure_provider(session, rows=prompt.app.output.get_size().rows)
+                            if result is None:
+                                renderer.console.print(Text("已取消登录。", style=WARNING))
+                            else:
+                                label, verified = result
+                                status = "已配置" if verified else "已保存，凭据将在模型请求时验证"
+                                renderer.console.print(Text(f"{label} · {status}。使用 /model 选择模型。", style=ACCENT))
+                        except ValueError as error:
+                            renderer.console.print(Text(str(error), style=ERROR))
+                    continue
+                command, _, argument = text.partition(" ")
+                if command == "/model":
+                    model_busy = session.busy or work.active or command_running or not prompts.empty()
+                    if model_busy and not argument:
                         renderer.console.print(Text("运行中或队列未清空时不能切换模型。", style=WARNING))
                         continue
+                    candidate, _ = session.split_model_choice(argument)
+                    if not model_busy and (not argument or candidate in CATALOG_EFFORT_PROVIDERS):
+                        await session.refresh_model_catalogs()
+                if text == "/model":
                     size = prompt.app.output.get_size()
                     choice = await pick_model(session, width=size.columns, height=size.rows)
                     if choice:
@@ -580,7 +618,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                             session.set_model(choice["model"])
                             session.set_effort(choice["effort"])
                             renderer.console.print(Text(
-                                f"模型：{choice['model']} · 推理强度：{choice['effort']}。", style=ACCENT))
+                                f"模型 {session.current_model_choice} · 推理强度 {choice['effort']}。", style=ACCENT))
                         except Exception as error:
                             renderer.console.print(Text(str(error), style=ERROR))
                     continue
@@ -588,7 +626,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                     if session.busy or work.active or command_running or not prompts.empty():
                         renderer.console.print(Text("运行中或队列未清空时不能切换推理强度。", style=WARNING))
                         continue
-                    levels = effort_choices(session, session.config.data["model"])
+                    levels = effort_choices(session, session.current_model_choice)
                     if len(levels) <= 1:
                         renderer.console.print(Text(
                             f"{session.config.data['model']} 在当前 API 环境下没有可切换的推理强度。"))

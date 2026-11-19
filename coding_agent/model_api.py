@@ -1,12 +1,13 @@
 """OpenAI-compatible requests and conversion to the core's reply format."""
 
+import json
 import random
 import time
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, OpenAI
 
-from agent_core import EventHandler, ModelReply
+from agent_core import EventHandler, ModelReply, public_tool_call
 from context_budget import DEFAULT_MAX_OUTPUT, fit_request
 from cancellation import check_cancelled
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
@@ -91,16 +92,25 @@ def _checked_reply(
     return ModelReply(text, calls)
 
 
-def _completion_reply(response, *, allow_tools: bool) -> ModelReply:
+def _gemini_signature(call):
+    extra = getattr(call, "extra_content", None)
+    google = extra.get("google") if isinstance(extra, dict) else None
+    signature = google.get("thought_signature") if isinstance(google, dict) else None
+    return signature if isinstance(signature, str) and signature else None
+
+
+def _completion_reply(response, *, allow_tools: bool, gemini: bool = False) -> ModelReply:
     choices = getattr(response, "choices", None)
     if not choices:
         return _checked_reply(None, [], None, allow_tools=allow_tools)
     choice = choices[0]
     message = getattr(choice, "message", None)
-    calls = [
-        call.model_dump(include={"id", "type", "function"})
-        for call in (getattr(message, "tool_calls", None) or [])
-    ]
+    calls = []
+    for call in getattr(message, "tool_calls", None) or []:
+        entry = call.model_dump(include={"id", "type", "function"})
+        if gemini and (signature := _gemini_signature(call)):
+            entry["_gemini_signature"] = signature
+        calls.append(entry)
     return _checked_reply(
         getattr(message, "content", None), calls, getattr(choice, "finish_reason", None),
         allow_tools=allow_tools,
@@ -113,6 +123,7 @@ class ChatModel:
         streaming: bool, max_attempts: int, retry_delay: float, tools: list[dict],
         *, context_limit: int = 80000, request_limit: int | None = None,
         disable_thinking: bool = False, effort: str | None = None, stream_usage: bool = False,
+        vendor: str | None = None, private_errors: bool = False,
     ):
         self.client = client
         self.name = name
@@ -128,25 +139,86 @@ class ChatModel:
         self.disable_thinking = disable_thinking
         self.effort = effort
         self.stream_usage = stream_usage
+        self.vendor = vendor
+        self.private_errors = private_errors
+
+    @property
+    def reasoning_source(self):
+        if self.vendor == "minimax" or self.vendor == "kimi" and self.name.startswith(("kimi-k3", "kimi-k2.5", "kimi-k2.6")):
+            return self.vendor
+        return None
+
+    def _request_messages(self, messages, tools):
+        prepared = []
+        for message in messages:
+            message = dict(message)
+            source = message.pop("_reasoning_source", None)
+            if message["role"] == "assistant":
+                if calls := message.get("tool_calls"):
+                    message["tool_calls"] = [public_tool_call(call) for call in calls]
+                    if self.vendor == "gemini":
+                        for index, (original, outgoing) in enumerate(zip(calls, message["tool_calls"])):
+                            signature = original.get("_gemini_signature")
+                            if index == 0 and not signature and self.name.startswith(("gemini-3", "gemini-4")):
+                                # Gemini permits this value for tool calls imported from other models.
+                                signature = "skip_thought_signature_validator"
+                            if signature:
+                                outgoing["extra_content"] = {"google": {"thought_signature": signature}}
+                if self.vendor == "openrouter" and source == f"openrouter:{self.name}":
+                    reasoning = json.loads(message.pop("reasoning_content"))
+                    details = reasoning.get("reasoning_details")
+                    if isinstance(details, list):
+                        message["reasoning_details"] = details
+                    elif isinstance(text := reasoning.get("reasoning"), str):
+                        message["reasoning"] = text
+                elif self.disable_thinking and self.effort and tools:
+                    if source is not None:
+                        message.pop("reasoning_content", None)
+                    message.setdefault("reasoning_content", "")
+                elif self.reasoning_source is None or source != self.reasoning_source:
+                    message.pop("reasoning_content", None)
+            prepared.append(message)
+        return prepared
+
+    def _save_router_reasoning(self, reply, details, text):
+        if isinstance(details, list) and details:
+            payload = {"reasoning_details": details}
+        elif isinstance(text, str) and text:
+            payload = {"reasoning": text}
+        else:
+            return
+        reply.reasoning_content = json.dumps(payload)
+        reply.reasoning_source = f"openrouter:{self.name}"
 
     def _create(self, emit: EventHandler, **kwargs: Any) -> Any:
-        kwargs["messages"], kwargs["max_tokens"] = fit_request(
-            kwargs["messages"], kwargs.get("tools") or [], limit=self.context_limit,
-            max_output=kwargs["max_tokens"], emit=emit,
+        tools = kwargs.get("tools") or []
+        kwargs["messages"], max_tokens = fit_request(
+            self._request_messages(kwargs["messages"], tools), tools, limit=self.context_limit,
+            max_output=kwargs.pop("max_tokens"), emit=emit,
         )
+        openai_reasoning = self.vendor == "openai" and self.name.startswith(("gpt-5", "o1", "o3", "o4"))
+        modern_limit = openai_reasoning or self.vendor in {"azure", "minimax"}
+        kwargs["max_completion_tokens" if modern_limit else "max_tokens"] = max_tokens
+        if modern_limit or self.reasoning_source or self.vendor == "xai":
+            kwargs.pop("temperature", None)
+            kwargs.pop("top_p", None)
+        if self.vendor == "minimax":
+            kwargs["extra_body"] = {"reasoning_split": True}
+            if self.name == "MiniMax-M3.1-Flash":
+                kwargs["extra_body"]["reasoning_effort"] = "low"
+        if self.effort and not self.disable_thinking:
+            extra = kwargs.setdefault("extra_body", {})
+            if self.vendor == "openrouter":
+                extra["reasoning"] = {"effort": self.effort}
+            else:
+                extra["reasoning_effort"] = self.effort
+        if self.vendor == "xai" and self.name == "grok-4.3":
+            kwargs["reasoning_effort"] = "none"
         if self.disable_thinking:
             # The disabled mode is the previous default for official DeepSeek.
             kwargs["extra_body"] = {"thinking": {"type": "enabled" if self.effort else "disabled"}}
             if self.effort:
                 kwargs["extra_body"]["reasoning_effort"] = self.effort
-        for message in kwargs["messages"]:
-            if message["role"] != "assistant":
-                continue
-            if self.disable_thinking and self.effort and kwargs.get("tools"):
-                # Sessions created without thinking have no reasoning to replay.
-                message.setdefault("reasoning_content", "")
-            else:
-                message.pop("reasoning_content", None)
         if kwargs.get("stream") and self.stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
         for attempt in range(1, self.max_attempts + 1):
@@ -155,7 +227,7 @@ class ChatModel:
                 raise ModelRequestBudgetError(f"已达到模型请求上限（{self.request_limit} 次）。")
             self.requests_sent += 1
             request_event = {"type": "model_request", "number": self.requests_sent, "attempt": attempt}
-            if self.disable_thinking and self.effort:
+            if self.effort:
                 request_event["effort"] = self.effort
             emit(request_event)
             try:
@@ -174,6 +246,15 @@ class ChatModel:
                     error.status_code in {408, 409, 429} or error.status_code >= 500
                 )
                 if not retryable or attempt == self.max_attempts:
+                    if self.private_errors:
+                        status = getattr(error, "status_code", None)
+                        detail = f"HTTP {status}" if status else "网络连接失败"
+                        if status in {401, 403}:
+                            raise ModelResponseError(
+                                f"供应商拒绝访问（{detail}）。请检查 /login 和模型权限。",
+                                reason="authentication_failed",
+                            ) from None
+                        raise AgentAPIError(f"模型请求失败（{detail}）。") from None
                     raise AgentAPIError(f"模型请求失败: {error}") from error
                 if self.requests_sent == self.request_limit:
                     raise ModelRequestBudgetError(
@@ -188,7 +269,8 @@ class ChatModel:
         raise AgentAPIError("模型请求次数必须大于零。")
 
     def summarize(self, messages: list[dict], emit: EventHandler) -> str:
-        response = self._create(emit, messages=messages, temperature=0, max_tokens=500)
+        response = self._create(emit, messages=messages, temperature=0,
+                                max_tokens=4096 if self.reasoning_source or self.vendor in {"openai", "azure"} else 500)
         RequestUsage(emit).chat(response.usage)
         return _completion_reply(response, allow_tools=False).text or ""
 
@@ -198,14 +280,19 @@ class ChatModel:
         kwargs = {"tools": self.tools, "tool_choice": "auto"} if allow_tools else {}
         response = self._create(
             emit, messages=messages, temperature=self.temperature, top_p=self.top_p,
-            max_tokens=DEFAULT_MAX_OUTPUT, stream=streaming, **kwargs,
+            max_tokens=16384 if self.reasoning_source else DEFAULT_MAX_OUTPUT, stream=streaming, **kwargs,
         )
         if streaming:
             return self._stream_reply(response, emit)
         RequestUsage(emit).chat(response.usage)
-        reply = _completion_reply(response, allow_tools=allow_tools)
-        if self.disable_thinking and self.effort:
+        reply = _completion_reply(response, allow_tools=allow_tools, gemini=self.vendor == "gemini")
+        if self.vendor == "openrouter":
+            message = response.choices[0].message
+            self._save_router_reasoning(reply, getattr(message, "reasoning_details", None),
+                                        getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None))
+        elif self.reasoning_source or self.disable_thinking and self.effort:
             reply.reasoning_content = getattr(response.choices[0].message, "reasoning_content", None)
+            reply.reasoning_source = self.reasoning_source
         if reply.text:
             emit({"type": "text_delta", "text": reply.text})
         return reply
@@ -213,6 +300,7 @@ class ChatModel:
     def _stream_reply(self, stream, emit: EventHandler) -> ModelReply:
         text = []
         reasoning = []
+        router_details = []
         calls = {}
         finish_reason = None
         usage = RequestUsage(emit)
@@ -225,9 +313,10 @@ class ChatModel:
                 except StopIteration:
                     break
                 except Exception as error:
+                    detail = type(error).__name__ if self.private_errors else error
                     raise ModelResponseError(
-                        f"流式响应中断：{error}", reason="stream_interrupted",
-                    ) from error
+                        f"流式响应中断：{detail}", reason="stream_interrupted",
+                    ) from (None if self.private_errors else error)
                 usage.chat(chunk.usage)
                 check_cancelled()
                 if not chunk.choices:
@@ -237,8 +326,15 @@ class ChatModel:
                 delta = choice.delta
                 if delta is None:
                     continue
-                if self.disable_thinking and self.effort and getattr(delta, "reasoning_content", None):
+                if (self.reasoning_source or self.disable_thinking and self.effort) and getattr(delta, "reasoning_content", None):
                     reasoning.append(delta.reasoning_content)
+                if self.vendor == "openrouter":
+                    details = getattr(delta, "reasoning_details", None)
+                    if isinstance(details, list):
+                        router_details.extend(details)
+                    fragment = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+                    if isinstance(fragment, str):
+                        reasoning.append(fragment)
                 if delta.content:
                     text.append(delta.content)
                     emit({"type": "text_delta", "text": delta.content})
@@ -249,6 +345,8 @@ class ChatModel:
                     entry = calls.setdefault(index, {
                         "id": "", "type": "function", "function": {"name": "", "arguments": ""},
                     })
+                    if self.vendor == "gemini" and (signature := _gemini_signature(call)):
+                        entry["_gemini_signature"] = signature
                     if call.id:
                         entry["id"] = call.id
                     if call.type:
@@ -266,6 +364,9 @@ class ChatModel:
             "".join(text) or None, [calls[index] for index in sorted(calls)],
             finish_reason, allow_tools=True,
         )
-        if reasoning:
+        if self.vendor == "openrouter":
+            self._save_router_reasoning(reply, router_details, "".join(reasoning))
+        elif reasoning:
             reply.reasoning_content = "".join(reasoning)
+            reply.reasoning_source = self.reasoning_source
         return reply

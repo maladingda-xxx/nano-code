@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from .provider_profiles import LoginStore, PROVIDERS, valid_model_id
+
 DEFAULTS = {
     "provider": "openai", "model": "deepseek-flash", "base_url": "https://api.deepseek.com",
     "models": [], "effort": "auto",
@@ -18,10 +20,7 @@ DEFAULTS = {
 }
 MODE_CYCLE = ("default", "acceptEdits", "plan", "auto")
 MODES = (*MODE_CYCLE, "dontAsk")
-
-
-def valid_model_id(value):
-    return isinstance(value, str) and bool(value) and not any(c.isspace() or ord(c) < 32 for c in value)
+MODEL_SETTINGS = ("provider", "base_url", "model", "models", "effort", "stream_usage")
 
 
 def config_home():
@@ -58,6 +57,9 @@ class Config:
     def __init__(self, root, *, overrides=None, env_file=None):
         self.root = Path(root).resolve()
         self.home = config_home()
+        self.logins = LoginStore(self.home)
+        self.active_login = None
+        self._legacy_model_settings = {}
         self.sources = []
         user = read_json(self.home / "settings.json")
         self.project = {}
@@ -145,15 +147,36 @@ class Config:
         url = urlsplit(self.data["base_url"])
         if url.scheme not in {"https", "http"} or not url.hostname or url.username or url.password:
             raise ValueError("base_url 必须是无内嵌凭据的 HTTP(S) 地址")
-        from .providers import effort_levels
+        from .reasoning import effort_levels
         effort = self.data["effort"]
         if effort not in (None, "auto", *effort_levels(self.data)):
             raise ValueError("当前模型或 API 端点不支持所配置的推理强度。")
 
     @property
     def api_key(self):
+        if self.active_login is not None:
+            return self.active_login.credential
         name = self.data["api_key_env"]
         return self.env.get(name) or self.env.get("ANTHROPIC_API_KEY" if self.data["provider"] == "anthropic" else "OPENAI_API_KEY")
+
+    @property
+    def provider_id(self):
+        return self.active_login.provider if self.active_login is not None else self.data["provider"]
+
+    @property
+    def legacy_model_settings(self):
+        return self.data if self.active_login is None else self._legacy_model_settings
+
+    def select_connection(self, login, model):
+        if self.active_login is None:
+            self._legacy_model_settings = {key: self.data.get(key) for key in MODEL_SETTINGS}
+        if login is None:
+            self.data.update(self._legacy_model_settings)
+            self.data["model"] = model
+        else:
+            self.data.update(provider=PROVIDERS[login.provider].adapter, base_url=login.base_url,
+                             model=model, models=list(login.models), effort="auto", stream_usage=False)
+        self.active_login = login
 
     @property
     def fingerprint(self):

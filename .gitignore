@@ -232,3 +232,4 @@ __marimo__/
 *.coding_agent_sessions.db-wal
 *.coding_agent_sessions.db-shm
 .nano/settings.local.json
+nano-provider-credentials/

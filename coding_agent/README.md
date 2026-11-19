@@ -1,17 +1,23 @@
 # Nano Code
 
-Nano Code 是一个 Python 终端编程助手。它通过 OpenAI 兼容 API 调用模型，在仓库里搜索和阅读代码、局部编辑文件、运行获授权的测试命令，并展示实际差异和退出码。
+Nano Code 是一个 Python 终端编程助手。它通过 OpenAI 兼容 API 或 Anthropic Messages API 调用模型，在仓库里搜索和阅读代码、局部编辑文件、运行获授权的测试命令，并展示实际差异和退出码。
 
 ## 安装和配置
 
-需要 Python 3.11+ 和一个兼容 OpenAI Chat Completions 的服务。安装后，从要操作的仓库运行 `nano-code`。
+需要 Python 3.11+。安装后，从要操作的仓库运行 `nano-code`。
 
 ```sh
 cd coding_agent
 python -m pip install .
 ```
 
-将 [.env.example](.env.example) 复制到自己管理的位置并填入 `API_KEY`。官方 DeepSeek 默认使用 `deepseek-flash`，工具调用采用非思考模式。可用 `MODEL_NAME` 和 `BASE_URL` 指定其他兼容服务。已有环境变量优先于配置文件。 [DeepSeek 模型与工具调用](https://api-docs.deepseek.com/guides/tool_calls/)
+在交互终端输入 `/login`，先选浏览器账号登录或 API Key / Token，再搜索供应商。API 凭据在隐藏输入框中填写。浏览器登录会打开 OpenRouter 授权页面。登录后输入 `/model`，按 `/` 搜索供应商或模型，按 Enter 应用。也可输入 `/model openai:gpt-5.4-mini` 直接切换。
+
+API Key / Token 支持 DeepSeek、OpenAI、Anthropic Claude、Google Gemini、OpenRouter、阿里云百炼 Qwen、月之暗面 Kimi、智谱 GLM、MiniMax、xAI Grok、Groq、Mistral 和 Azure OpenAI。Azure 使用资源地址和模型部署名。模型可用性取决于账号和地区。
+
+登录凭据以明文文件保存在本机用户目录 `~/.nano-code/nano-provider-credentials/`。若设置了 `NANO_CODE_HOME`，则保存在对应目录下。重启后登录仍可使用，模型需在当前进程中选择。
+
+需要使用旧版或脚本配置时，将 [.env.example](.env.example) 复制到自己管理的位置并填入 `API_KEY`。官方 DeepSeek 默认使用 `deepseek-flash`，工具调用采用非思考模式。可用 `MODEL_NAME` 和 `BASE_URL` 指定其他兼容服务。已有环境变量优先于配置文件。 [DeepSeek 模型与工具调用](https://api-docs.deepseek.com/guides/tool_calls/)
 
 ```sh
 nano-code --env-file /path/to/nano.env

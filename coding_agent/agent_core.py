@@ -14,11 +14,16 @@ EventHandler = Callable[[dict], None]
 RequestModel = Callable[[list[dict], bool, EventHandler], "ModelReply"]
 
 
+def public_tool_call(call):
+    return {key: value for key, value in call.items() if not key.startswith("_")}
+
+
 @dataclass
 class ModelReply:
     text: str | None = None
     tool_calls: list[dict] = field(default_factory=list)
     reasoning_content: str | None = field(default=None, repr=False)
+    reasoning_source: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,8 @@ def run_turn(
             assistant = {"role": "assistant", "content": reply.text}
             if reply.reasoning_content is not None:
                 assistant["reasoning_content"] = reply.reasoning_content
+                if reply.reasoning_source is not None:
+                    assistant["_reasoning_source"] = reply.reasoning_source
             if not reply.tool_calls:
                 if not reply.text or not reply.text.strip():
                     raise ModelResponseError("模型未返回有效文本。", reason="empty_response")
@@ -135,7 +142,7 @@ def run_turn(
                 check_cancelled()
                 call = pending[0]
                 tool_calls_made += 1
-                tool_scope = {"call": call, "tool_call_id": call["id"], "round": round_number + 1}
+                tool_scope = {"call": public_tool_call(call), "tool_call_id": call["id"], "round": round_number + 1}
                 publish({"type": "tool_request", **tool_scope}, durable=True)
                 started = perf_counter()
                 with edit_scope(scope["session_id"], scope["turn_id"], call["id"]):

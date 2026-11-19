@@ -29,9 +29,12 @@ def effort_color(level, now=None):
     return EFFORT_COLORS.get(level, "#b8c4e0")
 
 
-def _slider_fragments(session, selected, width):
-    choices = effort_choices(session, session.config.data["model"])
-    inner = max(20, width)
+def _slider_fragments(choices, selected, width):
+    inner = max(1, width)
+    if inner < len(choices) * (max(map(len, choices)) + 1):
+        label = choices[selected]
+        return [("class:picker.desc", f"档位 {selected + 1}/{len(choices)}\n"),
+                (f"class:picker.item {effort_color(label)} bold", label)]
     slot = max(1, inner // len(choices))
     positions = [min(inner - 1, i * slot + slot // 2) for i in range(len(choices))]
     left, right = "Faster", "Smarter"
@@ -62,7 +65,7 @@ def _footer_text():
 
 async def pick_effort(session, *, width=None):
     """Show the effort slider and return the chosen level or None."""
-    choices = effort_choices(session, session.config.data["model"])
+    choices = effort_choices(session, session.current_model_choice)
     if len(choices) <= 1:
         return None
     current = session.config.data.get("effort") or "auto"
@@ -103,7 +106,7 @@ async def pick_effort(session, *, width=None):
         event.app.exit(result=None)
 
     control = FormattedTextControl(
-        lambda: _slider_fragments(session, state["selected"], dialog_width - 2),
+        lambda: _slider_fragments(choices, state["selected"], dialog_width - 2),
         key_bindings=bindings,
         focusable=True,
         show_cursor=False,

@@ -1,5 +1,6 @@
 """One session runtime for terminal, print, SDK and JSON-RPC entry points."""
 
+import asyncio
 import fnmatch
 import hashlib
 import json
@@ -9,6 +10,7 @@ import threading
 from contextlib import closing
 from functools import partial
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 
 import agent
@@ -25,7 +27,9 @@ from .config import Config, MODES, valid_model_id
 from .extensions import Hooks, discover, expand_skill
 from .mcp_client import MCPClient, MCPError, tool_name
 from .permissions import Permissions, READ_TOOLS, review_action
-from .providers import bundled_models, create_model, effort_levels
+from .provider_profiles import PROVIDERS
+from .providers import bundled_models, create_model
+from .reasoning import CATALOG_EFFORT_PROVIDERS, effort_levels
 
 _runtime_lock = threading.RLock()
 
@@ -92,6 +96,8 @@ class Session:
         self.mcp_tools = {}
         self.tool_schemas = [*builtins.TOOLS, *EXTRA_TOOLS]
         self.model = model
+        self._model_requests = 0
+        self._model_catalogs = {}
         self.hooks = Hooks(self.config.extensions("hooks"), self.root, self._emit)
         with _runtime_lock:
             self._activate()
@@ -134,6 +140,7 @@ class Session:
     def ensure_model(self):
         if self.model is None:
             self.model = create_model(self.config, self.tool_schemas)
+            self.model.requests_sent = self._model_requests
         return self.model
 
     def set_permission_mode(self, mode, *, allow_busy=False):
@@ -149,30 +156,142 @@ class Session:
         self.set_permission_mode(self._mode_before_plan if self.permissions.mode == "plan" else "plan")
 
     def model_choices(self):
-        data = self.config.data
-        return tuple(dict.fromkeys((data["model"], *data["models"], *bundled_models(data))))
+        config = self.config
+        legacy = config.legacy_model_settings
+        choices = [self.current_model_choice]
+        choices.extend(self._legacy_choice(model) for model in (
+            legacy["model"], *legacy["models"], *bundled_models(legacy),
+        ))
+        for saved in config.logins.configured():
+            login = self._catalog_for(saved)
+            choices.extend(f"{login.provider}:{model}" for model in login.models)
+        return tuple(dict.fromkeys(choices))
+
+    def _catalog_for(self, login):
+        if login is not None and (cached := self._model_catalogs.get(login.provider)):
+            saved, updated, _ = cached
+            if saved == login:
+                return updated
+        return login
+
+    async def refresh_model_catalogs(self):
+        from .provider_login import refresh_catalog
+
+        if self.busy:
+            return
+        now = monotonic()
+        stale = []
+        for login in self.config.logins.configured():
+            if login.provider in CATALOG_EFFORT_PROVIDERS:
+                cached = self._model_catalogs.get(login.provider)
+                if cached is None or login != cached[0] or now - cached[2] >= 300:
+                    stale.append(login)
+        results = await asyncio.gather(*(refresh_catalog(login) for login in stale))
+        for saved, result in zip(stale, results):
+            previous = self._catalog_for(saved)
+            updated = result or previous
+            self._model_catalogs[saved.provider] = (saved, updated, now)
+            if self.config.active_login in (saved, previous) and not self.busy:
+                self.config.active_login = updated
+                self.config.data["models"] = list(updated.models)
+                if (self.config.data["effort"] or "auto") not in self.model_efforts(self.current_model_choice):
+                    self.set_effort("auto")
+
+    @property
+    def current_model_choice(self):
+        active = self.config.active_login
+        model = self.config.data["model"]
+        return f"{active.provider}:{model}" if active is not None else self._legacy_choice(model)
+
+    def _legacy_choice(self, model):
+        needs_prefix = self.config.active_login is not None or self.split_model_choice(model)[0] is not None
+        return f"legacy:{model}" if needs_prefix else model
+
+    @staticmethod
+    def split_model_choice(choice):
+        provider, sep, model = choice.partition(":")
+        if sep and (provider == "legacy" or provider in PROVIDERS):
+            return provider, model
+        return None, choice
+
+    def model_efforts(self, choice):
+        provider, model = self.split_model_choice(choice)
+        config = self.config
+        login = None
+        if provider is None:
+            data, login = config.data, config.active_login
+        elif provider == "legacy":
+            data = config.legacy_model_settings
+        elif config.active_login is not None and provider == config.active_login.provider:
+            data, login = config.data, config.active_login
+        else:
+            definition = PROVIDERS[provider]
+            data = {"provider": definition.adapter, "base_url": definition.base_url}
+            if provider in CATALOG_EFFORT_PROVIDERS:
+                try:
+                    login = self._catalog_for(config.logins.read(provider))
+                except ValueError:
+                    pass
+        return ("auto", *effort_levels({**data, "model": model}, login))
 
     def set_model(self, model):
         if self.busy:
             raise ValueError("运行中不能切换模型。")
+        if not isinstance(model, str):
+            raise ValueError("用法：/model <模型 ID 或 供应商:模型 ID>")
+        provider, model = self.split_model_choice(model)
         if not valid_model_id(model):
-            raise ValueError("用法：/model <模型 ID>")
+            raise ValueError("用法：/model <模型 ID 或 供应商:模型 ID>")
+        active = self.config.active_login
+        if provider is not None:
+            login = None if provider == "legacy" else self._catalog_for(self.config.logins.read(provider))
+            if provider != "legacy" and login is None:
+                raise ValueError(f"请先通过 /login 配置 {PROVIDERS[provider].label}。")
+            if active != login:
+                self._switch_connection(login, model)
+                return
         data = self.config.data
         if model == data["model"]:
             return
         data["model"] = model
-        if data["effort"] not in effort_levels(data):
+        if data["effort"] not in self.model_efforts(self.current_model_choice):
             data["effort"] = "auto"
         if hasattr(self.model, "name"):
             self.model.name = model
         if hasattr(self.model, "effort"):
             self.model.effort = None if data["effort"] == "auto" else data["effort"]
 
+    def save_login(self, login):
+        if self.busy:
+            raise ValueError("运行中不能重新配置供应商。")
+        self.config.logins.save(login)
+        self._model_catalogs.pop(login.provider, None)
+        active = self.config.active_login
+        if active is not None and active.provider == login.provider:
+            model = self.config.data["model"]
+            if active.base_url != login.base_url or login.provider == "azure" and active.models != login.models:
+                model = login.models[0]
+            self._switch_connection(login, model)
+
+    def _switch_connection(self, login, model):
+        self.config.select_connection(login, model)
+        if self.config.data["effort"] not in self.model_efforts(self.current_model_choice):
+            self.config.data["effort"] = "auto"
+        self._close_model()
+
+    def _close_model(self):
+        model, self.model = self.model, None
+        if model is not None:
+            self._model_requests = getattr(model, "requests_sent", self._model_requests)
+            client = getattr(model, "client", None)
+            if hasattr(client, "close"):
+                client.close()
+
     def set_effort(self, effort):
         if self.busy:
             raise ValueError("运行中不能切换推理强度。")
         data = self.config.data
-        choices = ("auto", *effort_levels(data))
+        choices = self.model_efforts(self.current_model_choice)
         if effort not in choices:
             raise ValueError(f"用法：/effort {' | '.join(choices)}")
         data["effort"] = effort
@@ -452,10 +571,7 @@ class Session:
         self.cancel()
         for client in self.mcp.values():
             client.close()
-        if self.model is not None:
-            client = getattr(self.model, "client", None)
-            if client and hasattr(client, "close"):
-                client.close()
+        self._close_model()
 
     def __enter__(self):
         return self

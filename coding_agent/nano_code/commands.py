@@ -24,7 +24,6 @@ from . import __version__, sessions
 from .config import MODES
 from .diff_view import files_text, parse_diff, totals
 from .extensions import expand_skill
-from .providers import effort_levels
 
 
 def expand_references(session, text):
@@ -51,7 +50,7 @@ def diagnostics(session):
         "workspace": str(session.root), "config_home": str(session.config.home),
         "session_db": str(session_db),
         "git": shutil.which("git"), "node": shutil.which("node"),
-        "provider": session.config.data["provider"], "model": session.config.data["model"],
+        "provider": session.config.provider_id, "model": session.config.data["model"],
         "effort": session.config.data["effort"] or "auto", "permission_mode": session.permissions.mode,
         "api_key_configured": bool(session.config.api_key), "project_extensions_trusted": session.config.trusted,
         "skills": len(session.skills), "mcp_configured": list(session.config.data["mcpServers"]),
@@ -125,7 +124,7 @@ def execute_command(session, line, renderer, *, console=None, running=False):
         out.print("已保存旧会话并开始新会话。")
     elif command == "/status":
         out.print(Text(session.git(["status", "--short", "--branch"])))
-        out.print(Text(f"{session.uid} · {session.config.data['provider']} / {session.config.data['model']} · {session.permissions.mode}"))
+        out.print(Text(f"{session.uid} · {session.config.provider_id} / {session.config.data['model']} · {session.permissions.mode}"))
     elif command == "/diff":
         text = safe_text(session.git_diff(argument == "--staged"))
         files = parse_diff(text)
@@ -200,19 +199,20 @@ def execute_command(session, line, renderer, *, console=None, running=False):
                 with sessions.lease(session.uid):
                     session.persist()
                 out.print("已恢复。结果不确定的操作需先核查；不会自动重放命令。")
+    elif command == "/login":
+        raise ValueError("请在交互终端中单独输入 /login，然后按提示登录。")
     elif command == "/model":
         if argument:
             session.set_model(argument)
-        out.print(Text(f"{session.config.data['provider']} / {session.config.data['model']}"))
+        out.print(Text(f"{session.config.provider_id} / {session.config.data['model']}"))
         if not argument:
             out.print(Text("可选模型 · " + " / ".join(session.model_choices())))
     elif command == "/effort":
         data = session.config.data
-        levels = effort_levels(data)
-        if not levels and not argument:
+        choices = session.model_efforts(session.current_model_choice)
+        if len(choices) == 1 and not argument:
             out.print(Text(f"{data['model']} 在当前 API 环境下没有可切换的推理强度。"))
             return
-        choices = ("auto", *levels)
         if argument:
             session.set_effort(argument)
         out.print(Text(f"当前推理强度：{data.get('effort') or 'auto'} · {' / '.join(choices)}"))

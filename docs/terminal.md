@@ -9,16 +9,16 @@ Nano Code 是参考 Claude Code 交互设计的本地编程助手。它从项目
 ```powershell
 python -m pip install -e .\coding_agent
 python -m nano_code --version
-nano-code setup
-$env:API_KEY = '<你的模型 API Key>'
-nano-code doctor
+nano-code
 ```
 
-安装后 `nano` 与 `nano-code` 等价，可直接用 `nano` 启动；如果系统中已有 GNU nano 等同名命令，优先使用 `nano-code`。`setup` 保存 API 类型、地址和模型 ID。默认使用 DeepSeek 的 OpenAI 兼容接口。接入其他兼容服务时设置对应的 Base URL 和模型 ID。使用 Anthropic Messages API 时选择 `anthropic`，并设置 `ANTHROPIC_API_KEY` 或 `API_KEY`。如果 `nano-code` 不在 PATH，可以用安装时的同一个 `python` 运行 `python -m nano_code`。
+安装后 `nano` 与 `nano-code` 等价。如果系统中已有 GNU nano 等同名命令，请使用 `nano-code`。如果 `nano-code` 不在 PATH，可以用安装时的同一个 `python` 运行 `python -m nano_code`。
+
+首次启动后输入 `/login`。选择 API Key / Token 可配置 13 家供应商，选择浏览器账号登录可使用 OpenRouter。配置后输入 `/model`，选中对应模型再开始对话。登录按供应商保存，重启后可直接用 `/model` 重新选择。用 `/model legacy:deepseek-flash` 可回到原有 DeepSeek 配置。 [供应商与配置详情](../coding_agent/README.md#安装和配置)
 
 如果 Windows 上的 `nano-code.exe` 仍从 `agent` 导入，或报找不到 `cancellation`，通常是旧的 0.3 可编辑安装仍然生效。用 `(Get-Command nano-code).Source` 检查启动器所在目录，在对应环境中执行 `python -m pip install -e .\coding_agent`，再执行 `nano-code --version`。例如启动器在 `D:\miniconda3\Scripts` 时，从 Conda `base` 环境安装，或明确使用 `& 'D:\miniconda3\python.exe' -m pip install -e .\coding_agent`。可编辑安装会继续读取仓库里的 `coding_agent/.env`。
 
-模型配置按命令行参数、环境变量、显式 `--env-file`、用户配置文件和内置默认值选取。`~/.nano-code/settings.json` 保存用户设置，`~/.nano-code/.env` 可保存仅供本机使用的凭据。源码安装时继续读取原有 `coding_agent/.env`。受信任的项目可用 `.nano/settings.json` 和 `.nano/settings.local.json` 覆盖用户 JSON 配置。`NANO_CODE_HOME` 可指定其他配置目录。
+旧版和脚本模式的模型配置按命令行参数、环境变量、显式 `--env-file`、用户配置文件和内置默认值选取。`nano-code setup` 可保存 API 类型、地址和模型 ID。`~/.nano-code/settings.json` 保存用户设置，`~/.nano-code/.env` 可保存仅供本机使用的凭据。源码安装时继续读取原有 `coding_agent/.env`。受信任的项目可用 `.nano/settings.json` 和 `.nano/settings.local.json` 覆盖用户 JSON 配置。`NANO_CODE_HOME` 可指定其他配置目录。
 
 ## 日常使用
 
@@ -32,13 +32,16 @@ nano-code doctor
 | 审阅 | `/status` 查看 Git 状态，`/diff` 查看工作区差异，`/diff --staged` 查看暂存差异。编辑文件后直接显示 `Update(路径) +N -M` 和整行背景色的改动块，超过 12 行时提示展开。`/output` 展开最近一轮工具输出，Ctrl+O 切换展开模式。 |
 | 会话 | `/sessions` 列表，`/resume <名称或 ID>` 恢复，`/rename` 重命名，`/fork` 复制对话。命令行支持 `--continue` 和 `--resume <ID>`。 |
 | 恢复 | `/undo` 回退当前会话的最近一次内置文件编辑。`/checkpoints <轮次 ID>` 预览，`/restore <轮次 ID>` 恢复该轮次。`/recover` 列出异常中断的轮次。 |
-| 模型 | `/model` 打开内嵌选择对话框：↑/↓ 或数字选择，←/→ 调整该模型的推理强度，Enter 同时应用模型和强度，Esc 取消；`/model <ID>` 直接切换。输入 `/model ` 后可补全候选。用户设置中的 `models` 是可补全的模型 ID 列表。 |
+| 供应商登录 | `/login` 先选登录方式，再搜索供应商。使用隐藏输入框填写 API Key 或 Token，或在浏览器批准 OpenRouter 授权。Esc 或 Ctrl+C 可取消。 |
+| 模型 | `/model` 显示已配置供应商和模型。按 `/` 搜索，↑/↓ 或数字选择，←/→ 调整支持的推理强度，Enter 应用，Esc 取消。也可用 `/model 供应商:模型ID` 切换。 |
 | 上下文 | `/context` 分别显示消息、工具与协议开销、回复预留和剩余输入空间的 token 估算。`/compact [重点]` 生成摘要，报告压缩前后用量，并给出可用 `/resume` 打开的原对话归档 ID。`/cost` 查看服务端用量，`/export` 导出对话。 |
-| 推理强度 | 直连官方 DeepSeek 且模型为 `deepseek-flash` 或 `deepseek-v4-pro` 时，`/effort` 打开横向滑轨对话框，`←/→` 调整，Enter 应用；auto 为黄色、low 为绿色、high 为紫色、max 为动态炫彩。`/effort low`、`/effort high`、`/effort max` 可直接切换，`/effort auto` 恢复适配器默认。启动时也可传 `--effort` 或设置 `REASONING_EFFORT`。 |
+| 推理强度 | `/effort` 按所选模型显示可用档位。用 `←/→` 调整，Enter 应用，也可输入 `/effort high` 等命令。`/effort auto` 恢复当前连接的默认行为，直连 Kimi K3 系列使用服务端默认档 `max`。启动时配置的模型也可用 `--effort` 或 `REASONING_EFFORT` 设置。 |
 | 权限模式 | `/plan` 进入只读计划，再输入一次会返回先前模式。`/auto` 开关自动模式，`/permissions` 查看或指定模式。Shift+Tab 在默认、接受编辑、计划和自动模式之间循环，运行中也可以切换，新模式影响后续工具调用。底部状态行显示当前模式，例如 `⏵⏵ auto mode on (shift+tab to cycle)`；`dontAsk` 不参与循环，用 `/permissions` 切换。 |
 | 项目约定 | 启动时读取 `CLAUDE.md` 和 `AGENTS.md`，访问不同子目录的文件时读取相应约定。`/init` 生成项目模板，`/memory` 维护项目记忆。 |
 
 内置的 `edit_file` 和 `write_file` 执行后会在终端显示统一 diff：按文件分组的 `Update(路径)`（新建文件显示 `Create`）标题、`+新增 -删除` 行数，以及整行铺满终端宽度的绿色新增行和红色删除行背景。代码保留语法高亮，新增和删除行带新旧行号。默认最多显示 12 行，其余用 `/output` 展开；`/diff` 使用同一套渲染，按文件显示标题和统计。
+
+`/model` 会刷新已登录的 OpenRouter 和 Claude 模型目录，并读取模型公开的推理档位。目录暂时不可用时沿用已有数据。Kimi、DeepSeek、Gemini、Groq 等直连模型按已支持的系列识别档位。当前连接没有可识别的档位时，只使用 `auto`。
 
 恢复时会检查文件是否仍与 Nano Code 当时写入的内容一致，发现冲突会保留当前文件。可恢复范围包括通过 `edit_file` 和 `write_file` 完成的修改。测试命令、MCP 工具和 hooks 造成的外部变更需要用 Git 或对应系统的记录审阅。对话分支共用项目文件。需要独立修改文件时，请从两个 Git worktree 分别启动。
 
@@ -109,7 +112,7 @@ nano-code doctor --export .\diag.json
 
 删除数据库会丢失 `/sessions`、`/resume`、`/checkpoints`、`/restore` 和 `/undo` 的记录，但不会修改或回滚工作区里的文件。文件名和路径变化后，旧检查点也会失去可恢复性。数据库可能包含原始对话、工具输出和文件快照，导出、备份或共享前应审阅。
 
-重置凭据可删除 `~/.nano-code/.env` 并重新配置；删除用户设置会恢复默认模型配置。
+重新运行 `/login` 可以更新该供应商的凭据。退出后删除 `~/.nano-code/nano-provider-credentials/` 下对应供应商的文件可以移除本机保存的登录。旧版凭据仍由 `~/.nano-code/.env` 或环境变量管理。
 
 本版本覆盖本地 CLI 常用工作流。Claude Code 的 IDE、桌面、云端、Remote Control、账号体系、托管集成、插件市场、Agent Teams、系统沙箱和自动授权分类器仍有差异。MCP OAuth、完整 hooks 事件集和 Claude Code 的设置格式也尚未覆盖。
 

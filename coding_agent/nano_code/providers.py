@@ -12,6 +12,8 @@ from context_budget import DEFAULT_MAX_OUTPUT, fit_request
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 from model_api import ChatModel, RequestUsage, _checked_reply
 
+from .reasoning import effort_levels, provider_kind
+
 
 def bundled_models(data):
     endpoint = urlsplit(data["base_url"])
@@ -20,25 +22,26 @@ def bundled_models(data):
     return ()
 
 
-def effort_levels(data):
-    return ("low", "high", "max") if data["model"] in bundled_models(data) else ()
-
-
 def create_model(config, tools):
     d = config.data
-    if not config.api_key:
-        raise ValueError(f"未配置 API Key。请设置 {d['api_key_env']}，或运行 nano-code setup。")
+    credential = config.api_key
+    if not credential:
+        raise ValueError(f"未配置 API Key。请运行 /login 后用 /model 选择模型，或设置 {d['api_key_env']}。")
     if d["provider"] == "anthropic":
         return AnthropicModel(config, tools)
     host = urlsplit(d["base_url"]).hostname
     effort = d.get("effort")
+    login = config.active_login
+    vendor = provider_kind(d, login)
     return ChatModel(
-        OpenAI(api_key=config.api_key, base_url=d["base_url"], max_retries=0, timeout=d["request_timeout"]),
+        OpenAI(api_key=credential, base_url=d["base_url"], max_retries=0, timeout=d["request_timeout"],
+               http_client=httpx.Client() if login is not None else None),
         name=d["model"], temperature=d["temperature"], top_p=d["top_p"], streaming=d["streaming"],
         max_attempts=d["max_retries"], retry_delay=d["retry_base_delay"], tools=tools, context_limit=d["context_limit"],
         request_limit=d.get("request_limit"), disable_thinking=host == "api.deepseek.com",
-        effort=effort if effort in effort_levels(d) else None,
-        stream_usage=host in {"api.openai.com", "api.deepseek.com"} or d.get("stream_usage") is True,
+        effort=effort if effort in effort_levels(d, login) else None,
+        stream_usage=host in {"api.openai.com", "api.deepseek.com", "api.minimax.io"} or d.get("stream_usage") is True,
+        vendor=vendor, private_errors=login is not None,
     )
 
 
@@ -53,6 +56,8 @@ def anthropic_messages(messages):
         if role == "tool":
             role = "user"
             content.append({"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": m.get("content") or ""})
+        elif role == "assistant" and m.get("reasoning_content"):
+            content = json.loads(m["reasoning_content"])
         else:
             if m.get("content"):
                 content.append({"type": "text", "text": m["content"]})
@@ -80,10 +85,19 @@ class AnthropicModel:
 
     def __call__(self, messages, allow_tools, emit):
         d = self.config.data
+        source = f"anthropic:{self.name}"
+        messages = [
+            m if m.get("_reasoning_source") == source else {k: v for k, v in m.items() if k != "reasoning_content"}
+            for m in messages
+        ]
+        effort = d.get("effort")
+        adjustable = effort in effort_levels(d, self.config.active_login)
         fitted, output = fit_request(messages, self.tools if allow_tools else [], limit=self.context_limit,
                                      max_output=DEFAULT_MAX_OUTPUT, emit=emit)
         system, turns = anthropic_messages(fitted)
         payload = {"model": self.name, "system": system, "messages": turns, "max_tokens": output, "stream": self.streaming}
+        if adjustable:
+            payload["output_config"] = {"effort": effort}
         if allow_tools:
             payload["tools"] = [{"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"]["parameters"]} for t in self.tools]
         base = d["base_url"].rstrip("/")
@@ -93,7 +107,10 @@ class AnthropicModel:
             if d.get("request_limit") and self.requests_sent >= d["request_limit"]:
                 raise ModelRequestBudgetError("已达到模型请求上限。")
             self.requests_sent += 1
-            emit({"type": "model_request", "number": self.requests_sent, "attempt": attempt + 1})
+            request = {"type": "model_request", "number": self.requests_sent, "attempt": attempt + 1}
+            if adjustable:
+                request["effort"] = effort
+            emit(request)
             usage = RequestUsage(emit)
             try:
                 with self.client.stream("POST", url, json=payload) as response:
@@ -120,15 +137,20 @@ class AnthropicModel:
         if reason not in {"end_turn", "tool_use", "stop_sequence"}:
             raise ModelResponseError(f"Anthropic 响应未正常结束: {reason}", reason="response_truncated" if reason == "max_tokens" else "incomplete_response")
         text, calls = [], []
-        for block in raw.get("content", []):
+        blocks = raw.get("content", [])
+        for block in blocks:
             if block["type"] == "text":
                 text.append(block["text"])
             elif block["type"] == "tool_use":
                 calls.append({"id": block["id"], "type": "function", "function": {"name": block["name"], "arguments": json.dumps(block["input"])}})
         if not self.streaming and text:
             emit({"type": "text_delta", "text": "\n".join(text)})
-        return _checked_reply("\n".join(text) or None, calls,
-                              "tool_calls" if reason == "tool_use" else "stop", allow_tools=allow_tools)
+        reply = _checked_reply("\n".join(text) or None, calls,
+                               "tool_calls" if reason == "tool_use" else "stop", allow_tools=allow_tools)
+        if calls and any(block["type"] in {"thinking", "redacted_thinking"} for block in blocks):
+            reply.reasoning_content = json.dumps(blocks)
+            reply.reasoning_source = source
+        return reply
 
     def _stream(self, response, emit, usage):
         raw, blocks, fragments, stopped = {}, {}, {}, False
@@ -153,6 +175,9 @@ class AnthropicModel:
                     emit({"type": "text_delta", "text": delta["text"]})
                 elif delta["type"] == "input_json_delta":
                     fragments[index] += delta["partial_json"]
+                elif delta["type"] in {"thinking_delta", "signature_delta"}:
+                    field = delta["type"].removesuffix("_delta")
+                    blocks[index][field] = blocks[index].get(field, "") + delta[field]
             elif kind == "message_delta":
                 raw.update(event["delta"])
                 snapshot = event.get("usage") or {}

@@ -29,9 +29,20 @@ def _ensure_execution_tables(conn: sqlite3.Connection) -> None:
             request TEXT NOT NULL,
             status TEXT NOT NULL,
             exit_code INTEGER,
+            verification TEXT,
+            invalidates_verification INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (turn_id, round, call_id)
         )
     """)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(execution_tools)")}
+    for name, definition in (("verification", "TEXT"), ("invalidates_verification", "INTEGER NOT NULL DEFAULT 0")):
+        if name not in columns:
+            try:
+                conn.execute(f"ALTER TABLE execution_tools ADD COLUMN {name} {definition}")
+            except sqlite3.OperationalError:
+                if name not in {row[1] for row in conn.execute("PRAGMA table_info(execution_tools)")}:
+                    raise
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_turns_session ON execution_turns(session_id)")
 
 
 def record_execution(event: dict, messages: list[dict]) -> None:
@@ -64,20 +75,49 @@ def record_execution(event: dict, messages: list[dict]) -> None:
             key = (turn_id, event.get("round"), event.get("tool_call_id"))
             if kind == "tool_request":
                 conn.execute(
-                    "INSERT INTO execution_tools VALUES (?, ?, ?, ?, 'started', NULL)",
+                    """INSERT INTO execution_tools (turn_id, round, call_id, request, status)
+                       VALUES (?, ?, ?, ?, 'started')""",
                     (*key, json.dumps(event["call"])),
                 )
             elif kind == "tool_result":
                 outcome = event["outcome"]
                 updated = conn.execute(
-                    """UPDATE execution_tools SET status = ?, exit_code = ?
+                    """UPDATE execution_tools SET status = ?, exit_code = ?, verification = ?, invalidates_verification = ?
                        WHERE turn_id = ? AND round = ? AND call_id = ? AND status = 'started'""",
-                    (outcome["status"], outcome["exit_code"], *key),
+                    (outcome["status"], outcome["exit_code"], outcome.get("verification"),
+                     int(bool(outcome.get("invalidates_verification"))), *key),
                 )
                 if updated.rowcount != 1:
                     raise TurnPersistenceError("找不到待记录结果的工具调用。")
     except (sqlite3.Error, ValueError, TypeError) as error:
         raise TurnPersistenceError(f"无法保存执行记录：{error}") from error
+
+
+def execution_facts(session_id: str) -> tuple[dict | None, list[str]]:
+    with closing(sqlite3.connect(_get_db_path())) as conn, conn:
+        _ensure_execution_tables(conn)
+        latest = conn.execute(
+            """SELECT e.rowid, e.call_id, e.verification, e.exit_code
+               FROM execution_tools e JOIN execution_turns t ON e.turn_id=t.turn_id
+               WHERE t.session_id=? AND e.verification IS NOT NULL ORDER BY e.rowid DESC LIMIT 1""",
+            (session_id,),
+        ).fetchone()
+        verification = None
+        if latest:
+            rowid, call_id, status, exit_code = latest
+            stale = conn.execute(
+                """SELECT 1 FROM execution_tools e JOIN execution_turns t ON e.turn_id=t.turn_id
+                   WHERE t.session_id=? AND e.rowid>? AND e.invalidates_verification LIMIT 1""",
+                (session_id, rowid),
+            ).fetchone()
+            verification = {"call_id": call_id, "status": "stale" if stale else status, "exit_code": exit_code}
+        uncertain = [row[0] for row in conn.execute(
+            """SELECT e.call_id FROM execution_tools e JOIN execution_turns t ON e.turn_id=t.turn_id
+               WHERE t.session_id=? AND e.status IN ('started', 'interrupted', 'timeout', 'uncertain')
+               ORDER BY e.rowid DESC LIMIT 8""",
+            (session_id,),
+        )]
+    return verification, uncertain
 
 
 def _process_running(pid: int) -> bool:

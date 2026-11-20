@@ -34,7 +34,7 @@ nano-code
 | 恢复 | `/undo` 回退当前会话的最近一次内置文件编辑。`/checkpoints <轮次 ID>` 预览，`/restore <轮次 ID>` 恢复该轮次。`/recover` 列出异常中断的轮次。 |
 | 供应商登录 | `/login` 先选登录方式，再搜索供应商。使用隐藏输入框填写 API Key 或 Token，或在浏览器批准 OpenRouter 授权。Esc 或 Ctrl+C 可取消。 |
 | 模型 | `/model` 显示已配置供应商和模型。按 `/` 搜索，↑/↓ 或数字选择，←/→ 调整支持的推理强度，Enter 应用，Esc 取消。也可用 `/model 供应商:模型ID` 切换。 |
-| 上下文 | `/context` 分别显示消息、工具与协议开销、回复预留和剩余输入空间的 token 估算。`/compact [重点]` 生成摘要，报告压缩前后用量，并给出可用 `/resume` 打开的原对话归档 ID。`/cost` 查看服务端用量，`/export` 导出对话。 |
+| 上下文 | `/context` 查看模型、窗口来源、输入预算、回复预留、压力和最近压缩。`/context stats` 查看实际用量和估算误差。`/compact [重点]` 生成工作摘要。`/resume` 沿用原会话 ID，`/export` 导出原始对话。 |
 | 推理强度 | `/effort` 按所选模型显示可用档位。用 `←/→` 调整，Enter 应用，也可输入 `/effort high` 等命令。`/effort auto` 恢复当前连接的默认行为，直连 Kimi K3 系列使用服务端默认档 `max`。启动时配置的模型也可用 `--effort` 或 `REASONING_EFFORT` 设置。 |
 | 权限模式 | `/plan` 进入只读计划，再输入一次会返回先前模式。`/auto` 开关自动模式，`/permissions` 查看或指定模式。Shift+Tab 在默认、接受编辑、计划和自动模式之间循环，运行中也可以切换，新模式影响后续工具调用。底部状态行显示当前模式，例如 `⏵⏵ auto mode on (shift+tab to cycle)`；`dontAsk` 不参与循环，用 `/permissions` 切换。 |
 | 项目约定 | 启动时读取 `CLAUDE.md` 和 `AGENTS.md`，访问不同子目录的文件时读取相应约定。`/init` 生成项目模板，`/memory` 维护项目记忆。 |

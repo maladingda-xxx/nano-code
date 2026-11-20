@@ -32,11 +32,12 @@ nano-code --env-file /path/to/nano.env
 | 工具 | 用途 |
 |---|---|
 | `search_workspace` | 在工作区搜索文本，显示路径和行号。Git 仓库中的未跟踪文件遵循忽略规则。 |
-| `read_file`、`list_directory`、`search_in_file` | 查看文件、目录及单文件内的匹配上下文。 |
+| `read_file`、`list_directory`、`search_in_file` | 查看文件、目录及匹配上下文。读文件和单文件搜索支持 `offset`、`limit` 分页。 |
 | `edit_file` | 替换一处精确匹配的原文，返回 diff。原文不存在或有多处匹配时会拒绝编辑。 |
 | `write_file` | 创建、覆盖或追加工作区文件。 |
 | `execute_command` | 用参数数组执行单条命令，报告退出码、标准输出和错误输出。 |
 | `ask_followup_question` | 在交互模式下向用户提问。 |
+| `read_tool_output` | 按裁剪提示中的引用分页读取当前会话记录中的工具输出，每页最多 4,000 字符。 |
 
 交互模式中，同一轮内相同目录和参数的命令共享一次授权。授权后的程序拥有当前用户的进程权限。文件工具限制在工作区，命令的工作目录也在工作区内。
 
@@ -46,7 +47,31 @@ nano-code --env-file /path/to/nano.env
 
 工具轮数只剩两轮时，Nano Code 会向模型追加一条运行时提示，要求优先提交最小修改或给出当前结论；该提示不写入会话存档。
 
-交互和脚本模式的每次模型请求都按 `CONTEXT_LIMIT_TOKENS` 估算消息和工具定义的占用，并为回复预留空间。超预算时，本地裁剪优先保留项目说明、当前任务和最新的工具批次，长输出可保留首尾。旧轮次可从请求中移除，交互会话存档和进行中的恢复记录保留原文。工具调用及对应结果始终成批保留或移除。必要内容仍无法放入预算时，返回 `context_budget_exceeded`。[Chat Completions 工具消息格式](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+## 上下文管理
+
+交互、脚本、SDK 和 RPC 共用请求上下文。每次请求估算消息、工具定义和协议开销，为模型回复预留空间。安装可选依赖 `coding-agent[tiktoken]` 后，可对支持的 OpenAI 模型使用对应的本地 tokenizer，其余使用标明来源的 UTF-8 启发式估算。输入达到可用输入预算的 60% 时，优先缩减较旧的工具结果。达到 75% 时，可对已完成的历史生成工作摘要，每个用户轮次最多发起一次自动摘要请求。超过本地预算时继续裁剪完整轮次和工具批次，必要内容仍放不下时返回 `context_budget_exceeded`。
+
+压缩视图保留当前用户原话、近期消息、配套工具调用和结构化工作摘要。摘要覆盖任务、约束、发现、修改、测试、决策、剩余工作、相关文件与风险。实际修改路径、最近验证结果和待核查操作来自本地执行记录，任务清单保留为模型登记的状态。摘要失败、缩减不足或写入失败时沿用已有视图。摘要请求计入 `MAX_MODEL_REQUESTS`。
+
+恢复同一 UID 时，Nano Code 校验摘要对应的原始历史范围。用 `/export session.json` 导出原始消息，或在模型遇到裁剪提示时让它调用 `read_tool_output`。回读使用字符偏移和常见凭据遮盖。保存的工具原文受原有执行上限与文件分页限制，SQLite 及导出文件仍可能包含敏感文本。既有旧会话和以前生成的归档均可以按原 ID 打开。
+
+项目记忆保存在 `.nano/MEMORY.md`，可用 `/memory <内容>` 追加。按当前任务词汇挑选少量 Markdown 章节，可在标题中标明 `[verified 2026-10-01]`、`[inferred]` 或 `[stale]`。前两类标签和日期随正文保留，显式过期章节跳过。
+
+下列设置可写入 `~/.nano-code/settings.json` 或受信任的项目设置。
+
+| 设置 | 默认值与含义 |
+| --- | --- |
+| `context_limit` | 本地上限 80,000 tokens，环境变量为 `CONTEXT_LIMIT_TOKENS`。有效上限还受已知模型窗口限制。 |
+| `context_models` | 可按模型 ID 或 `供应商:模型 ID` 设置 `window` 和 `max_output`，例如 `{"deepseek:deepseek-flash":{"window":1000000,"max_output":8192}}`。 |
+| `context_safety_tokens` | 安全余量 512 tokens，小窗口自动限制余量。 |
+| `context_tool_result_chars` | 常规工具结果正文目标 3,600 字符，随工具类型和压力调整。 |
+| `context_prune_at`、`context_compact_at` | 分别为 `0.60` 和 `0.75`，按可用输入空间计算。 |
+| `context_auto_compact` | 默认开启。可设为 `false`，仍可手动压缩。 |
+| `anthropic_prompt_cache` | 默认关闭。开启后，Anthropic 官方 HTTPS 直连为系统提示及其前面的工具定义声明临时缓存。 |
+
+OpenAI 和 DeepSeek 的隐式缓存受供应商条件与重复前缀影响。Nano Code 保持工具定义顺序和系统提示前缀稳定，并汇总实际返回的缓存读取、缓存写入和推理用量。缓存命中仍占逻辑输入窗口。服务端没返回的细分字段省略。旧版 `nano-code-legacy` 入口保留请求级预算及裁剪行为。
+
+## 会话与恢复
 
 在模型或工具运行期间按 `Ctrl+C` 可以结束本轮并回到输入框。会话保存在仓库根目录的 `.coding_agent_sessions.db`，下次启动可以选择恢复。SQLite 中的文件快照可能包含源文件的旧内容。
 
@@ -63,6 +88,8 @@ nano-code --env-file /path/to/nano.env
 | `/restore <轮次 ID>` | 预览并恢复指定轮次仍可恢复的文件；冲突文件保留当前内容。 |
 | `/recover`、`/recover <轮次 ID>` | 列出未结束的轮次，或恢复指定轮次的对话。 |
 | `/save <名称>`、`/load <名称>`、`/sessions` | 保存、恢复和列出会话；列表显示稳定会话 UID。 |
+| `/context`、`/context stats` | 查看下次请求的估算预算、分项占用、阈值和压缩记录。统计显示本进程用量、裁剪次数与估算误差。 |
+| `/compact [重点]` | 手动压缩可归纳的历史，显示压缩前后估算，并保留原始会话。 |
 | `/clear`、`/stats`、`/help`、`/exit` | 清空上下文、查看统计和帮助、退出。 |
 
 ## 脚本模式
@@ -81,6 +108,8 @@ nano-code -p '修复失败的测试并验证' --json --allow-command '["python",
 | 事件 | 字段 |
 | --- | --- |
 | `model_request` | `number` 为进程内累计模型请求数，`attempt` 为本次模型调用的尝试序号 |
+| `context_pruning`、`context_compaction` | 工具输出裁剪数量、摘要触发方式、结果和前后估算 |
+| `usage` | 服务端报告的增量用量。按供应商实际字段提供缓存与推理统计 |
 | `tool_output` | `stream` 为 `stdout` 或 `stderr`，`text` 是刚收到的输出片段 |
 | `tool_result` | `result` 提供易读文本，`outcome` 提供工具状态、退出码、stdout、stderr、耗时毫秒数和截断标记 |
 | `turn_end` | `status` 表示完成回复、调用出错或中断。 `reason` 提供具体结束原因，包括工具轮数耗尽和无工具降级。`changes` 提供本轮通过内置文件工具成功编辑或写入的文件及次数，`tool_calls` 为本轮工具调用数 |

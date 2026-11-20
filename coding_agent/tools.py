@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
+from itertools import islice
 from pathlib import Path
 
 from agent_core import ToolResult
@@ -63,71 +64,48 @@ def _format_size(size_bytes: int) -> str:
 # 1. read_file —— 读取文件内容（带行号，像 cat -n）
 # ============================================================
 
-def read_file(file_path: str, line_start: int | None = None, line_end: int | None = None) -> str:
-    """
-    读取指定文件的内容，返回带行号的文本。
-
-    参数:
-        file_path:   文件的绝对路径或相对路径
-        line_start:  起始行号（从 1 开始），不传则从第 1 行开始
-        line_end:    结束行号（包含），不传则读到文件末尾
-
-    返回:
-        带行号的文本内容，格式同 cat -n 命令
-
-    异常:
-        ToolInputError:     参数不合法
-        ToolExecutionError: 文件不存在、无法读取等
-    """
+def read_file(
+    file_path: str, line_start: int | None = None, line_end: int | None = None, *,
+    offset: int | None = None, limit: int | None = None,
+) -> str:
+    """Read a numbered page. offset counts skipped lines and limit counts returned lines."""
     if not file_path or not file_path.strip():
         raise ToolInputError("file_path 不能为空", tool_name="read_file")
-
     path = workspace_path(_workspace_root, file_path, "read_file")
-
-    if not path.exists():
-        raise ToolExecutionError(f"文件不存在 —— {file_path}", tool_name="read_file")
     if not path.is_file():
-        raise ToolExecutionError(f"路径是一个目录，不是文件 —— {file_path}", tool_name="read_file")
-
+        raise ToolExecutionError(f"无法读取文件 —— {file_path}", tool_name="read_file")
+    if offset is not None and (type(offset) is not int or offset < 0 or line_start is not None):
+        raise ToolInputError("offset 必须为非负整数，且不能与 line_start 同时使用。", tool_name="read_file")
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= 500):
+        raise ToolInputError("limit 必须在 1 到 500 之间。", tool_name="read_file")
+    start = offset + 1 if offset is not None else max(1, line_start or 1)
+    if line_end is not None and line_end < start:
+        raise ToolInputError(f"起始行 {start} 大于结束行 {line_end}。", tool_name="read_file")
+    page_size = limit or (500 if line_end is not None else 200)
+    end = min(start + page_size - 1, line_end) if line_end is not None else start + page_size - 1
+    check_more = line_end is None or end < line_end
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except PermissionError:
-        raise ToolExecutionError(f"没有权限读取文件 —— {file_path}", tool_name="read_file")
-    except UnicodeDecodeError:
-        try:
-            with open(path, "r", encoding="latin-1") as f:
-                lines = f.readlines()
-        except Exception as e:
-            raise ToolExecutionError(
-                f"文件编码无法识别 —— {file_path}，详情: {e}", tool_name="read_file"
-            )
-    except Exception as e:
-        raise ToolExecutionError(
-            f"读取文件时发生异常 —— {file_path}，详情: {e}", tool_name="read_file"
-        )
-
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                with path.open(encoding=encoding) as stream:
+                    lines = list(islice(stream, start - 1, end + int(check_more)))
+                break
+            except UnicodeDecodeError:
+                continue
+    except OSError as error:
+        raise ToolExecutionError(f"读取文件失败 —— {file_path}，详情: {error}", tool_name="read_file") from error
     if not lines:
-        return "文件为空。"
-    total_lines = len(lines)
-    start = line_start if line_start is not None else 1
-    end = line_end if line_end is not None else total_lines
-
-    start = max(1, start)
-    end = min(total_lines, end)
-
-    if start > end:
-        raise ToolInputError(
-            f"line_start ({line_start}) 大于 line_end ({line_end})", tool_name="read_file"
-        )
-
-    result_parts = []
-    for i in range(start - 1, end):
-        line_num = i + 1
-        line = lines[i].rstrip("\r\n")
-        result_parts.append(f"{line_num:>6}\t{line}")
-
-    return "\n".join(result_parts)
+        if start == 1:
+            return "文件为空。"
+        raise ToolInputError(f"起始行 {start} 超出文件范围。", tool_name="read_file")
+    page = lines[:end - start + 1]
+    result = []
+    for number, line in enumerate(page, start):
+        content = line.rstrip("\r\n")
+        result.append(f"{number:>6}\t{content}")
+    if len(page) < len(lines):
+        result.append(f"（{file_path} 还有更多内容，请从 line_start={end + 1} 或 offset={end} 继续读取。）")
+    return "\n".join(result)
 
 
 # ============================================================
@@ -186,7 +164,7 @@ def list_directory(dir_path: str) -> str:
 # 3. search_in_file —— 在文件中搜索关键词
 # ============================================================
 
-def search_in_file(file_path: str, query: str) -> str:
+def search_in_file(file_path: str, query: str, *, offset: int = 0, limit: int = 30) -> str:
     """
     在文件中搜索包含 query 的行，返回匹配行及其上下文（前后各 2 行）。
 
@@ -198,6 +176,8 @@ def search_in_file(file_path: str, query: str) -> str:
         raise ToolInputError("file_path 不能为空", tool_name="search_in_file")
     if not query or not query.strip():
         raise ToolInputError("query 不能为空", tool_name="search_in_file")
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+        raise ToolInputError("offset 必须为非负整数，limit 必须在 1 到 100 之间。", tool_name="search_in_file")
 
     path = workspace_path(_workspace_root, file_path, "search_in_file")
 
@@ -225,11 +205,10 @@ def search_in_file(file_path: str, query: str) -> str:
         )
 
     total_lines = len(lines)
-    matched_indices = []
-
-    for i, line in enumerate(lines):
-        if query in line:
-            matched_indices.append(i)
+    matches = (i for i, line in enumerate(lines) if query in line)
+    matched_indices = list(islice(matches, offset, offset + limit + 1))
+    more_matches = len(matched_indices) > limit
+    matched_indices = matched_indices[:limit]
 
     if not matched_indices:
         return f"未在 {file_path} 中找到 \"{query}\""
@@ -238,8 +217,8 @@ def search_in_file(file_path: str, query: str) -> str:
     context_radius = 2
 
     for idx in matched_indices:
-        for offset in range(-context_radius, context_radius + 1):
-            ctx_idx = idx + offset
+        for delta in range(-context_radius, context_radius + 1):
+            ctx_idx = idx + delta
             if 0 <= ctx_idx < total_lines:
                 lines_to_show.add(ctx_idx)
 
@@ -256,6 +235,8 @@ def search_in_file(file_path: str, query: str) -> str:
         result_parts.append(f"{marker} {idx + 1:>6}\t{lines[idx].rstrip()}")
         prev_idx = idx
 
+    if more_matches:
+        result_parts.append(f"（已达到匹配上限，使用 offset={offset + limit} 继续搜索。）")
     return "\n".join(result_parts)
 
 
@@ -568,7 +549,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取文件内容，返回带行号的文本（类似 cat -n）。可以指定行号范围来只读取文件的一部分。",
+            "description": "读取带行号的文件内容，默认每页最多 200 行。可指定行号范围或使用 offset/limit 分页。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -582,8 +563,10 @@ TOOLS: list[dict] = [
                     },
                     "line_end": {
                         "type": "integer",
-                        "description": "结束行号（包含），留空则读到文件末尾",
+                        "description": "结束行号（包含），每页最多 500 行",
                     },
+                    "offset": {"type": "integer", "minimum": 0, "description": "跳过行数，与 line_start 二选一"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
                 },
                 "required": ["file_path"],
             },
@@ -622,6 +605,8 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "description": "搜索关键词（区分大小写）",
                     },
+                    "offset": {"type": "integer", "minimum": 0, "description": "跳过的匹配数"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
                 "required": ["file_path", "query"],
             },

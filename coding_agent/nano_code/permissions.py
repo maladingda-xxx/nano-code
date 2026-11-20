@@ -6,7 +6,7 @@ import json
 from cancellation import check_cancelled
 from exceptions import AgentAPIError
 
-READ_TOOLS = {"read_file", "list_directory", "search_workspace", "search_in_file", "glob_files", "git_status", "git_diff", "load_skill", "task_list"}
+READ_TOOLS = {"read_file", "list_directory", "search_workspace", "search_in_file", "glob_files", "git_status", "git_diff", "load_skill", "task_list", "read_tool_output"}
 WRITE_TOOLS = {"edit_file", "write_file"}
 AUTO_REVIEW_TOOLS = {*WRITE_TOOLS, "execute_command"}
 

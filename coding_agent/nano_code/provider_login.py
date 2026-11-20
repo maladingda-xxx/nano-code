@@ -51,6 +51,24 @@ def _catalog_models(provider, payload):
     return tuple(dict.fromkeys(models)), reasoning
 
 
+def _catalog_limits(provider, records, models):
+    limits = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(model := record.get("id"), str) or model not in models:
+            continue
+        if provider == "anthropic":
+            values = {"window": record.get("max_input_tokens"), "max_output": record.get("max_tokens")}
+        elif provider == "openrouter":
+            top = record.get("top_provider")
+            values = {"window": record.get("context_length"),
+                      "max_output": top.get("max_completion_tokens") if isinstance(top, dict) else None}
+        else:
+            continue
+        if profile := {key: n for key, n in values.items() if type(n) is int and n > 0}:
+            limits[model] = profile
+    return limits
+
+
 def _catalog_headers(login):
     if PROVIDERS[login.provider].adapter == "anthropic":
         return {"x-api-key": login.credential, "anthropic-version": "2023-06-01"}
@@ -61,9 +79,11 @@ async def _fetch_catalog(login, client):
     response = await client.get(login.base_url + PROVIDERS[login.provider].catalog)
     response.raise_for_status()
     if login.provider != "azure":
-        models, reasoning = _catalog_models(login.provider, response.json())
+        catalog = response.json()
+        models, reasoning = _catalog_models(login.provider, catalog)
         if models:
-            return replace(login, models=models, reasoning=reasoning)
+            return replace(login, models=models, reasoning=reasoning,
+                           limits=_catalog_limits(login.provider, catalog["data"], set(models)))
     return login
 
 

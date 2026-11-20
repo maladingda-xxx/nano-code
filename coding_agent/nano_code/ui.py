@@ -27,7 +27,6 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from context_budget import estimate_tokens
 from . import __version__
 from .config import MODES, MODE_CYCLE
 from .diff_view import file_title, files_text, parse_diff, totals
@@ -60,7 +59,7 @@ COMMANDS = {
     "/login": "配置模型供应商的账号或 API Key",
     "/effort": "查看或切换受支持模型的推理强度",
     "/permissions": "查看或切换权限模式", "/plan": "切换只读计划模式", "/auto": "切换自动模式",
-    "/context": "查看上下文占用", "/compact": "生成摘要并保留原始存档",
+    "/context": "查看预算与占用，stats 查看详情", "/compact": "生成工作摘要并保留原始对话",
     "/cost": "查看实际 token 用量", "/tasks": "查看任务列表", "/skills": "查看可用 Skills",
     "/agents": "查看只读子代理", "/mcp": "查看、连接、断开 MCP", "/hooks": "查看已启用 hooks",
     "/memory": "查看或追加项目记忆", "/init": "为当前项目创建 AGENTS.md 模板",
@@ -229,6 +228,10 @@ class Renderer:
                     self.console.print(Text(f"     +{len(lines)-1} lines · /output 展开", style="dim"))
         elif kind in {"error", "notice", "recovery_error"}:
             self.console.print(Text("  " + safe_text(event["text"]), style=WARNING if kind == "notice" else ERROR))
+        elif kind == "context_compaction" and event["trigger"] == "automatic":
+            text = (f"自动压缩约 {event['before']:,} → {event['after']:,} tokens"
+                    if event["status"] == "completed" else f"自动压缩跳过 · {event['reason']}")
+            self.console.print(Text("  " + text, style="dim"))
         elif kind == "subagent_start":
             self.console.print(Text(f"● {event['agent']}  ·  read-only subagent", style=ACCENT))
         elif kind == "turn_end":
@@ -369,8 +372,9 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
         if width >= 58:
             fragments.append(("class:toolbar.hint", hint))
         if width >= 105:
-            context = estimate_tokens(session.messages)
-            fragments.append(("class:toolbar", f"  │  {session.uid[:8]}  │  ~{context:,}/{session.config.data['context_limit']:,} tokens  │  queue {prompts.qsize()} "))
+            budget = session.last_context_budget
+            usage = f"~{budget.input_tokens:,}/{budget.limit:,} tokens  │  " if budget else ""
+            fragments.append(("class:toolbar", f"  │  {session.uid[:8]}  │  {usage}queue {prompts.qsize()} "))
         return fragments
 
     try:

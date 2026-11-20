@@ -207,7 +207,7 @@ def build_prompt(task):
     return prompt
 
 
-def run_live(env_file, task_id=PILOT):
+def run_live(env_file, task_id=PILOT, agent_root=ROOT):
     config, key = load_config(env_file)
     task = TASKS[task_id]
     if task["type"] == "recovery":
@@ -219,11 +219,17 @@ def run_live(env_file, task_id=PILOT):
     seeded_diff = prepare_task(task, destination, report_dir)
     fixture_digest = fixture_sha256(destination)
     prompt = build_prompt(task)
-    command = [sys.executable, "-B", str(ROOT / "coding_agent" / "agent.py"),
-               "-p", prompt, "--json"]
+    # Select the targeted checkout explicitly so editable installations do not
+    # accidentally compare the same source against itself.
+    source = agent_root / "coding_agent"
+    if not (source / "nano_code" / "cli.py").is_file():
+        raise RuntimeError(f"Nano Code CLI source not found under {source}.")
+    command = [sys.executable, "-B", "-m", "nano_code", "-p", prompt, "--json"]
+    command.extend(["--permission-mode", "plan" if task["type"] == "read" else "acceptEdits"])
     if env_file.is_file():
         command.extend(["--env-file", str(env_file)])
-    env = {**os.environ, **settings, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, **settings, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(source),
+           "NANO_CODE_HOME": str(report_dir / "nano-home")}
     start = time.monotonic()
     try:
         completed = subprocess.run(
@@ -251,8 +257,26 @@ def run_live(env_file, task_id=PILOT):
     requests = [event for event in events if event["type"] == "model_request"]
     usage = [event for event in events if event["type"] == "usage"]
     end = next((event for event in reversed(events) if event["type"] == "turn_end"), {})
-    allowed_tools = {"read_file", "search_workspace", "search_in_file", "list_directory"}
+    allowed_tools = {"read_file", "search_workspace", "search_in_file", "list_directory",
+                     "glob_files", "git_status", "git_diff", "read_tool_output", "task_list", "task_update"}
     actions = [event["call"]["function"]["name"] for event in events if event["type"] == "tool_request"]
+    previous_success = set()
+    repeated_operations = 0
+    for event in events:
+        if event["type"] not in {"tool_request", "tool_result"}:
+            continue
+        call = event["call"]["function"]
+        if call["name"] in {"task_list", "task_update"}:
+            continue
+        try:
+            arguments = json.dumps(json.loads(call["arguments"]), sort_keys=True)
+        except (ValueError, TypeError):
+            arguments = call["arguments"]
+        key = (call["name"], arguments)
+        if event["type"] == "tool_request":
+            repeated_operations += int(key in previous_success)
+        elif event["outcome"]["status"] == "ok":
+            previous_success.add(key)
     consulted = any(
         event["type"] == "tool_result" and event["outcome"]["status"] == "ok"
         and event["call"]["function"]["name"] in {"read_file", "search_workspace", "search_in_file"}
@@ -281,13 +305,16 @@ def run_live(env_file, task_id=PILOT):
     report = {
         "task": task_id, "task_type": task["type"], "result": result,
         "target_revision": git(destination, "rev-parse", "HEAD"),
-        "agent_revision": git(ROOT, "rev-parse", "HEAD"),
-        "agent_tree_dirty": bool(git(ROOT, "status", "--short", "--", "coding_agent")),
+        "agent_revision": git(agent_root, "rev-parse", "HEAD"),
+        "agent_tree_dirty": bool(git(agent_root, "status", "--short", "--", "coding_agent")),
         "provider_host": host, "model": model, "settings": settings,
         "allowed_paths": sorted(allowed_paths(task)), "prompt": prompt,
         "elapsed_seconds": elapsed, "requests": len(requests),
-        "usage": {field: sum(event[field] for event in usage)
-                  for field in ("input_tokens", "output_tokens", "total_tokens")} if usage else None,
+        "usage": {field: sum(event.get(field, 0) for event in usage)
+                  for field in sorted({key for event in usage for key in event if key.endswith("_tokens")})} if usage else None,
+        "repeated_successful_operations": repeated_operations,
+        "compactions": sum(event["type"] == "context_compaction" and event["status"] == "completed" for event in events),
+        "api_cost": None,
         "human_interventions": 0, "tool_calls": actions, "verification": end.get("verification"),
         "turn_reason": end.get("reason"), "exit_code": exit_code,
         "unexpected_untracked": untracked, "fixture_sha256": fixture_digest,
@@ -337,6 +364,7 @@ def main():
     parser.add_argument("--task", choices=LIVE_TASKS, default=PILOT)
     parser.add_argument("--run", help="pending report directory to verify after reviewing the candidate")
     parser.add_argument("--env-file", type=Path)
+    parser.add_argument("--agent-root", type=Path, default=ROOT)
     args = parser.parse_args()
     CACHE.mkdir(parents=True, exist_ok=True)
     try:
@@ -348,7 +376,8 @@ def main():
             return verify_candidate(args.run)
         if args.env_file is not None and not args.env_file.is_file():
             raise RuntimeError(f"Configuration file not found: {args.env_file}")
-        return run_live((args.env_file or ROOT / "coding_agent" / ".env").resolve(), args.task)
+        return run_live((args.env_file or ROOT / "coding_agent" / ".env").resolve(), args.task,
+                        args.agent_root.resolve())
     except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
         print(error, file=sys.stderr)
         return 2

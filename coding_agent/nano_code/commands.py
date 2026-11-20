@@ -15,7 +15,7 @@ from rich.text import Text
 
 import tools
 from changes import list_checkpoints, preview_checkpoint, resolve_turn_id, restore_checkpoint, undo_last_edit
-from context_budget import context_breakdown
+from context_budget import estimate_tokens
 from execution_store import execution_session, pending_executions, recover_execution
 from session_store import SESSION_FORMAT_VERSION, _get_db_path
 from workspace import workspace_path
@@ -158,10 +158,7 @@ def execute_command(session, line, renderer, *, console=None, running=False):
         session.label = argument
         out.print("会话已重命名。")
     elif command == "/fork":
-        from .runtime import history_digest
-        session.uid = sessions.fork(session.uid, session.messages, argument or None)
-        session._saved_digest = history_digest(session.messages)
-        session.label = argument or None
+        session.fork(argument or None)
         out.print(Text(f"已进入分支会话 {session.uid[:8]}。文件工作区仍共享。"))
     elif command == "/export":
         name = argument or f"nano-session-{session.uid[:8]}.md"
@@ -197,6 +194,7 @@ def execute_command(session, line, renderer, *, console=None, running=False):
                 session.uid = execution_session(turn_id) or session.uid
                 session.messages = [{"role": "system", "content": session.system_prompt()}, *[m for m in recovered if m["role"] != "system"]]
                 with sessions.lease(session.uid):
+                    session.restore_context()
                     session.persist()
                 out.print("已恢复。结果不确定的操作需先核查；不会自动重放命令。")
     elif command == "/login":
@@ -230,15 +228,49 @@ def execute_command(session, line, renderer, *, console=None, running=False):
             out.print(Text("可用模式 · " + " / ".join(MODES)))
             out.print_json(json.dumps(session.permissions.rules, ensure_ascii=False))
     elif command == "/context":
-        budget = context_breakdown(session.messages, session.tool_schemas, limit=session.config.data["context_limit"])
+        if argument == "stats":
+            stats = dict(session.context_stats)
+            samples = stats.pop("estimate_samples")
+            signed, absolute = stats.pop("input_error_sum"), stats.pop("input_abs_error_sum")
+            out.print_json(json.dumps({
+                **stats, "provider_usage": session.usage, "estimate_samples": samples,
+                "compactions": session.context.snapshot.count if session.context.snapshot else 0,
+                "mean_input_estimation_error": round(signed / samples, 1) if samples else None,
+                "mean_absolute_input_error": round(absolute / samples, 1) if samples else None,
+            }))
+            return
+        if argument:
+            raise ValueError("用法：/context [stats]")
+        view, _ = session._context_view(session.messages)
+        budget = session.context_budget(view)
+        settings = session.config.model_budget()
         table = Table(title="上下文预算估算（tokens）", box=box.SIMPLE)
         table.add_column("项目")
-        table.add_column("估算", justify="right")
+        table.add_column("数值", justify="right")
+        table.add_row("模型", session.current_model_choice)
+        table.add_row("模型窗口", f"{settings.window:,} · {settings.source}" if settings.window else "未知 · 本地回退")
+        table.add_row("估算方法", budget.method)
         for label, tokens in (
+            ("已用输入", budget.input_tokens),
+            ("输入上限", budget.limit - budget.reserved_output - budget.safety),
             ("消息", budget.messages), ("工具与协议", budget.overhead), ("回复预留", budget.reserved_output),
+            ("安全余量", budget.safety),
             ("剩余输入空间", max(0, budget.remaining)), ("上下文上限", budget.limit),
         ):
             table.add_row(label, f"{tokens:,}")
+        for label, roles in (("系统提示", {"system", "developer"}),
+                             ("用户与助手", {"user", "assistant"}), ("工具结果", {"tool"})):
+            table.add_row(label, f"{estimate_tokens([m for m in view if m['role'] in roles and not m.get('_context_memory')], settings.tokenizer):,}")
+        table.add_row("记忆与摘要", f"{estimate_tokens([m for m in view if m.get('_context_memory')], settings.tokenizer):,}")
+        threshold = session.config.data["context_compact_at"]
+        table.add_row("输入占用 / 压缩阈值", f"{budget.pressure:.1%} / {threshold:.0%}")
+        table.add_row("自动压缩", (
+            "关闭" if not session.config.data["context_auto_compact"]
+            else ("已达阈值" if budget.pressure >= threshold else "开启")
+        ))
+        snapshot = session.context.snapshot
+        if snapshot:
+            table.add_row("最近压缩", f"{snapshot.timestamp} · {snapshot.trigger} · {snapshot.before:,} → {snapshot.after:,}")
         out.print(table)
         if budget.remaining < 0:
             out.print(Text(f"当前消息超出输入预算约 {-budget.remaining:,} tokens，请使用 /compact 或缩短输入。"))

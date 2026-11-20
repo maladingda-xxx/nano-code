@@ -43,6 +43,15 @@ def read_bytes(path: Path) -> bytes | None:
         return None
 
 
+def changed_paths(session_id: str, limit: int = 12) -> list[str]:
+    with closing(sqlite3.connect(_get_db_path())) as conn, conn:
+        _ensure_journal(conn)
+        return [path[:200] for (path,) in conn.execute(
+            "SELECT path FROM file_edits WHERE session_id=? GROUP BY path ORDER BY MAX(id) DESC LIMIT ?",
+            (session_id, limit),
+        )]
+
+
 def _replace(path: Path, before: bytes | None, after: bytes | None) -> None:
     if after is None:
         if read_bytes(path) != before:

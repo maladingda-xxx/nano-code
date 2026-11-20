@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
+from context_budget import DEFAULT_MAX_OUTPUT, ModelBudget
 
 from .provider_profiles import LoginStore, PROVIDERS, valid_model_id
 
@@ -14,6 +16,9 @@ DEFAULTS = {
     "models": [], "effort": "auto",
     "api_key_env": "API_KEY", "permission_mode": "default", "max_turns": 24,
     "context_limit": 80000, "command_timeout": 120, "request_timeout": 60,
+    "context_models": {}, "context_safety_tokens": 512, "context_tool_result_chars": 3600,
+    "context_prune_at": 0.60, "context_compact_at": 0.75, "context_auto_compact": True,
+    "anthropic_prompt_cache": False,
     "streaming": True, "temperature": 0.3, "theme": "dark",
     "top_p": 1.0, "max_retries": 3, "retry_base_delay": 0.5,
     "permissions": {"allow": [], "deny": [], "autoAllow": []}, "mcpServers": {}, "hooks": {},
@@ -143,7 +148,6 @@ class Config:
             if (not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv)
                     or not argv[0].strip() or not isinstance(cwd, str) or not cwd.strip()):
                 raise ValueError("permissions.autoAllow 需要非空的 cwd 和命令参数数组。")
-        from urllib.parse import urlsplit
         url = urlsplit(self.data["base_url"])
         if url.scheme not in {"https", "http"} or not url.hostname or url.username or url.password:
             raise ValueError("base_url 必须是无内嵌凭据的 HTTP(S) 地址")
@@ -151,6 +155,46 @@ class Config:
         effort = self.data["effort"]
         if effort not in (None, "auto", *effort_levels(self.data)):
             raise ValueError("当前模型或 API 端点不支持所配置的推理强度。")
+        d = self.data
+        if (type(d["context_safety_tokens"]) is not int or d["context_safety_tokens"] < 0
+                or type(d["context_tool_result_chars"]) is not int or d["context_tool_result_chars"] < 256):
+            raise ValueError("context_safety_tokens 须为非负整数，context_tool_result_chars 须至少为 256。")
+        for key in ("context_auto_compact", "anthropic_prompt_cache"):
+            if type(d[key]) is not bool:
+                raise ValueError(f"{key} 必须是布尔值。")
+        prune, compact = d["context_prune_at"], d["context_compact_at"]
+        if not all(type(n) in {int, float} for n in (prune, compact)) or not 0 < prune < compact < 1:
+            raise ValueError("要求 0 < context_prune_at < context_compact_at < 1。")
+        profiles = d["context_models"]
+        if not isinstance(profiles, dict) or any(
+            not isinstance(profile, dict) or any(
+                key not in {"window", "max_output"} or type(n) is not int or n <= 0
+                for key, n in profile.items()
+            ) for profile in profiles.values()
+        ):
+            raise ValueError("context_models 的 window 和 max_output 必须是正整数。")
+
+    def model_budget(self, target=DEFAULT_MAX_OUTPUT):
+        from .reasoning import provider_kind
+
+        d = self.data
+        name = d["model"]
+        vendor = provider_kind(d, self.active_login)
+        declared = self.active_login.limits.get(name, {}) if self.active_login else {}
+        source = "供应商目录" if declared.get("window") else "本地回退"
+        if vendor == "deepseek" and name in {"deepseek-flash", "deepseek-v4-pro"}:
+            declared = {"window": 1_000_000, "max_output": 384_000}
+            source = "供应商文档"
+        overrides = d["context_models"]
+        profile = {**overrides.get(name, {}), **overrides.get(f"{vendor}:{name}", {})}
+        if "window" in profile:
+            source = "模型配置"
+        effective = {**declared, **profile}
+        window = effective.get("window")
+        limit = min(d["context_limit"], window) if window is not None else d["context_limit"]
+        return ModelBudget(limit, min(target, effective.get("max_output", target)),
+                           min(d["context_safety_tokens"], limit // 8),
+                           name if vendor == "openai" else "unknown", window, source)
 
     @property
     def api_key(self):

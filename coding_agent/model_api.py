@@ -8,11 +8,21 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, OpenAI
 
 from agent_core import EventHandler, ModelReply, public_tool_call
-from context_budget import DEFAULT_MAX_OUTPUT, fit_request
+from context_budget import DEFAULT_MAX_OUTPUT, context_breakdown, fit_request
 from cancellation import check_cancelled
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 
 TOOL_MARKUP_MARKERS = ("<｜｜DSML｜｜", "<|tool_call|>", "<tool_calls>")
+
+
+def _chat_reasoning_source(vendor, name):
+    if vendor == "minimax" or vendor == "kimi" and name.startswith(("kimi-k3", "kimi-k2.5", "kimi-k2.6")):
+        return vendor
+    return None
+
+
+def chat_output_target(vendor, name):
+    return 16384 if _chat_reasoning_source(vendor, name) else DEFAULT_MAX_OUTPUT
 
 
 class RequestUsage:
@@ -21,12 +31,14 @@ class RequestUsage:
     def __init__(self, emit: EventHandler):
         self.emit = emit
         self.reported: dict[str, int] = {}
+        self.anthropic_snapshot: dict[str, int] = {}
 
-    def report(self, input_tokens=None, output_tokens=None, total_tokens=None):
+    def report(self, input_tokens=None, output_tokens=None, total_tokens=None, **details):
         counts = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
+            **details,
         }
         if total_tokens is None:
             parts = [counts[key] if counts[key] is not None else self.reported.get(key)
@@ -46,7 +58,26 @@ class RequestUsage:
 
     def chat(self, usage):
         if usage is not None:
-            self.report(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+            prompt = getattr(usage, "prompt_tokens_details", None)
+            completion = getattr(usage, "completion_tokens_details", None)
+            self.report(
+                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
+                cache_read_tokens=getattr(usage, "prompt_cache_hit_tokens", getattr(prompt, "cached_tokens", None)),
+                cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
+                cache_write_tokens=getattr(prompt, "cache_write_tokens", None),
+                reasoning_tokens=getattr(completion, "reasoning_tokens", None),
+            )
+
+    def anthropic(self, usage: dict):
+        for name in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
+            value = usage.get(name)
+            if type(value) is int and value >= 0:
+                self.anthropic_snapshot[name] = max(value, self.anthropic_snapshot.get(name, 0))
+        current = self.anthropic_snapshot
+        read = current.get("cache_read_input_tokens")
+        write = current.get("cache_creation_input_tokens")
+        logical_input = current["input_tokens"] + (read or 0) + (write or 0) if "input_tokens" in current else None
+        self.report(logical_input, current.get("output_tokens"), cache_read_tokens=read, cache_write_tokens=write)
 
 
 def _checked_reply(
@@ -123,7 +154,7 @@ class ChatModel:
         streaming: bool, max_attempts: int, retry_delay: float, tools: list[dict],
         *, context_limit: int = 80000, request_limit: int | None = None,
         disable_thinking: bool = False, effort: str | None = None, stream_usage: bool = False,
-        vendor: str | None = None, private_errors: bool = False,
+        vendor: str | None = None, private_errors: bool = False, budget_settings=None,
     ):
         self.client = client
         self.name = name
@@ -141,12 +172,15 @@ class ChatModel:
         self.stream_usage = stream_usage
         self.vendor = vendor
         self.private_errors = private_errors
+        self.budget_settings = budget_settings
+
+    @property
+    def output_target(self):
+        return chat_output_target(self.vendor, self.name)
 
     @property
     def reasoning_source(self):
-        if self.vendor == "minimax" or self.vendor == "kimi" and self.name.startswith(("kimi-k3", "kimi-k2.5", "kimi-k2.6")):
-            return self.vendor
-        return None
+        return _chat_reasoning_source(self.vendor, self.name)
 
     def _request_messages(self, messages, tools):
         prepared = []
@@ -192,10 +226,13 @@ class ChatModel:
 
     def _create(self, emit: EventHandler, **kwargs: Any) -> Any:
         tools = kwargs.get("tools") or []
+        purpose = kwargs.pop("purpose", "turn")
+        limit, max_output, safety, tokenizer = self._budget_options(kwargs.pop("max_tokens"))
         kwargs["messages"], max_tokens = fit_request(
-            self._request_messages(kwargs["messages"], tools), tools, limit=self.context_limit,
-            max_output=kwargs.pop("max_tokens"), emit=emit,
+            self._request_messages(kwargs["messages"], tools), tools, limit=limit,
+            max_output=max_output, emit=emit, safety=safety, model=tokenizer,
         )
+        estimate = context_breakdown(kwargs["messages"], tools, limit=limit, model=tokenizer)
         openai_reasoning = self.vendor == "openai" and self.name.startswith(("gpt-5", "o1", "o3", "o4"))
         modern_limit = openai_reasoning or self.vendor in {"azure", "minimax"}
         kwargs["max_completion_tokens" if modern_limit else "max_tokens"] = max_tokens
@@ -221,12 +258,14 @@ class ChatModel:
                 kwargs["extra_body"]["reasoning_effort"] = self.effort
         if kwargs.get("stream") and self.stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
-        for attempt in range(1, self.max_attempts + 1):
+        attempts = 1 if purpose == "compaction" else self.max_attempts
+        for attempt in range(1, attempts + 1):
             check_cancelled()
             if self.request_limit is not None and self.requests_sent >= self.request_limit:
                 raise ModelRequestBudgetError(f"已达到模型请求上限（{self.request_limit} 次）。")
             self.requests_sent += 1
-            request_event = {"type": "model_request", "number": self.requests_sent, "attempt": attempt}
+            request_event = {"type": "model_request", "number": self.requests_sent, "attempt": attempt,
+                             "estimated_input_tokens": estimate.input_tokens, "purpose": purpose}
             if self.effort:
                 request_event["effort"] = self.effort
             emit(request_event)
@@ -245,7 +284,7 @@ class ChatModel:
                 retryable = isinstance(error, APIConnectionError) or (
                     error.status_code in {408, 409, 429} or error.status_code >= 500
                 )
-                if not retryable or attempt == self.max_attempts:
+                if not retryable or attempt == attempts:
                     if self.private_errors:
                         status = getattr(error, "status_code", None)
                         detail = f"HTTP {status}" if status else "网络连接失败"
@@ -268,9 +307,14 @@ class ChatModel:
                     delay -= 0.1
         raise AgentAPIError("模型请求次数必须大于零。")
 
+    def _budget_options(self, max_output):
+        if self.budget_settings is None:
+            return self.context_limit, max_output, 0, ""
+        settings = self.budget_settings(max_output)
+        return settings.limit, settings.output, settings.safety, settings.tokenizer
+
     def summarize(self, messages: list[dict], emit: EventHandler) -> str:
-        response = self._create(emit, messages=messages, temperature=0,
-                                max_tokens=4096 if self.reasoning_source or self.vendor in {"openai", "azure"} else 500)
+        response = self._create(emit, messages=messages, temperature=0, purpose="compaction", max_tokens=4096)
         RequestUsage(emit).chat(response.usage)
         return _completion_reply(response, allow_tools=False).text or ""
 
@@ -280,7 +324,7 @@ class ChatModel:
         kwargs = {"tools": self.tools, "tool_choice": "auto"} if allow_tools else {}
         response = self._create(
             emit, messages=messages, temperature=self.temperature, top_p=self.top_p,
-            max_tokens=16384 if self.reasoning_source else DEFAULT_MAX_OUTPUT, stream=streaming, **kwargs,
+            max_tokens=self.output_target, stream=streaming, **kwargs,
         )
         if streaming:
             return self._stream_reply(response, emit)

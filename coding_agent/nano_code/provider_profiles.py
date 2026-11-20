@@ -73,6 +73,7 @@ class Login:
     models: tuple[str, ...]
     endpoint: str = ""
     reasoning: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    limits: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.provider not in PROVIDERS or not valid_secret(self.credential):
@@ -85,6 +86,13 @@ class Login:
             for model, levels in self.reasoning.items()
         ):
             raise ValueError("模型推理档位无效。")
+        if not isinstance(self.limits, dict) or any(
+            model not in self.models or not isinstance(profile, dict) or any(
+                key not in {"window", "max_output"} or type(n) is not int or n <= 0
+                for key, n in profile.items()
+            ) for model, profile in self.limits.items()
+        ):
+            raise ValueError("模型窗口元数据无效。")
         if self.provider == "azure":
             object.__setattr__(self, "endpoint", azure_endpoint(self.endpoint))
         elif self.endpoint:
@@ -110,7 +118,7 @@ class LoginStore:
             if not isinstance(reasoning, dict) or any(not isinstance(levels, list) for levels in reasoning.values()):
                 raise ValueError
             return Login(provider, raw["credential"], tuple(raw["models"]), raw.get("endpoint", ""),
-                         {model: tuple(levels) for model, levels in reasoning.items()})
+                         {model: tuple(levels) for model, levels in reasoning.items()}, raw.get("limits", {}))
         except FileNotFoundError:
             return None
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -136,7 +144,8 @@ class LoginStore:
                                              prefix=".login-", delete=False) as stream:
                 temporary = Path(stream.name)
                 json.dump({"credential": login.credential, "models": login.models,
-                           "endpoint": login.endpoint, "reasoning": login.reasoning}, stream, ensure_ascii=False)
+                           "endpoint": login.endpoint, "reasoning": login.reasoning,
+                           "limits": login.limits}, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(target)

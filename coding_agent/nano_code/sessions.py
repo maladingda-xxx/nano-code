@@ -72,25 +72,44 @@ def _set_label(conn, uid, label):
                  (uid, label.strip()))
 
 
-def fork(uid, messages, label=None):
+def fork(uid, messages, label=None, *, snapshot=None):
     new_uid = uuid4().hex
-    if not save(new_uid, messages, label or f"Fork of {uid[:8]}"):
+    name = label or f"Fork of {uid[:8]}"
+    if snapshot is not None:
+        save_context(new_uid, snapshot, messages=messages, label=name)
+    elif not save(new_uid, messages, name):
         raise ValueError("无法保存分支会话。")
     return new_uid
 
 
-def save_compaction(uid, original, compacted, label=None):
-    """Keep the full archive and replace the active history in one transaction."""
-    archive = uuid4().hex
+def _ensure_context(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS session_context (uid TEXT PRIMARY KEY, snapshot TEXT NOT NULL)")
+
+
+def load_context(uid):
+    with closing(_connect()) as conn, conn:
+        _ensure_context(conn)
+        row = conn.execute("SELECT snapshot FROM session_context WHERE uid=?", (uid,)).fetchone()
+    try:
+        return json.loads(row[0]) if row else None
+    except ValueError:
+        return None
+
+
+def save_context(uid, snapshot, *, messages=None, label=None):
+    """Publish the view in a single transaction. Manual compaction also saves history."""
     with closing(_connect()) as conn, conn:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("BEGIN IMMEDIATE")
-        legacy._write_session(conn, "__session_" + archive, original, uid=archive)
-        legacy._write_session(conn, "__session_" + uid, compacted, uid=uid)
-        _set_label(conn, archive, f"Before compact {uid[:8]}")
+        _ensure_context(conn)
+        if messages is not None:
+            legacy._write_session(conn, "__session_" + uid, messages, uid=uid)
         if label:
             _set_label(conn, uid, label)
-    return archive
+        conn.execute(
+            "INSERT INTO session_context VALUES (?, ?) ON CONFLICT(uid) DO UPDATE SET snapshot=excluded.snapshot",
+            (uid, json.dumps(snapshot, ensure_ascii=False)),
+        )
 
 
 def _alive(pid):

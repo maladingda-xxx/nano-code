@@ -16,11 +16,12 @@ from rich.console import Console
 
 from agent_core import ModelReply
 from exceptions import AgentAPIError
-from context_budget import context_breakdown, fit_request
+from context_budget import fit_request
 from nano_code import Session, __version__, sessions
 from nano_code.cli import main
 from nano_code.commands import diagnostics, execute_command, redact
 from nano_code.config import Config, write_json
+from nano_code.context import SUMMARY_FIELDS
 from nano_code.diff_view import files_text, parse_diff, totals
 from nano_code.effort_picker import effort_color, pick_effort
 from nano_code.mcp_client import MCPClient
@@ -251,7 +252,7 @@ def test_model_commands_and_context_keep_request_state(project, monkeypatch, cap
         with pytest.raises(ValueError, match="/effort"):
             execute_command(session, "/effort high", None, console=console)
         execute_command(session, "/context", None, console=console)
-        budget = context_breakdown(session.messages, session.tool_schemas, limit=12000)
+        budget = session.context_budget(session.messages)
         _, output_reserve = fit_request(session.messages, session.tool_schemas, limit=12000, max_output=4096,
                                         emit=lambda _: None)
         view = output.getvalue()
@@ -314,10 +315,15 @@ def test_compaction_preserves_original_history(project, monkeypatch, outcome):
             assert messages[-1]["content"].endswith("keep pending tests")
             if outcome == "cancelled":
                 session.cancel()
-            return long_text * 4 if outcome == "non_reducing" else "Pending tests are recorded."
+            summary = {key: "Pending tests are recorded." for key in SUMMARY_FIELDS}
+            if outcome == "non_reducing":
+                summary["findings"] = "x" * 4200
+            return json.dumps(summary)
 
     with Session(project, model=Summarizer()) as session:
-        session.messages += [{"role": "user", "content": long_text}, {"role": "assistant", "content": long_text}]
+        medium_text = long_text[:800] if outcome == "non_reducing" else long_text
+        session.messages += [{"role": "user", "content": medium_text}, {"role": "assistant", "content": medium_text},
+                             {"role": "user", "content": "Continue with the pending tests."}]
         assert session.persist()
         original = sessions.load(session.uid)["messages"]
         if outcome == "save_failed":
@@ -329,25 +335,28 @@ def test_compaction_preserves_original_history(project, monkeypatch, outcome):
                 write(conn, name, messages, uid=uid)
 
             monkeypatch.setattr(sessions.legacy, "_write_session", fail_active)
-        if outcome in {"cancelled", "save_failed"}:
-            with pytest.raises(KeyboardInterrupt if outcome == "cancelled" else sqlite3.OperationalError):
+        if outcome == "cancelled":
+            with pytest.raises(KeyboardInterrupt):
                 session.compact("keep pending tests")
         else:
             console = Console(file=io.StringIO())
             execute_command(session, "/compact keep pending tests", None, console=console)
             if outcome == "saved":
                 assert "→" in console.file.getvalue()
-            else:
+            elif outcome == "non_reducing":
                 assert "未缩小" in console.file.getvalue()
+            else:
+                assert "无法保存压缩记录" in console.file.getvalue()
         assert not session.busy
 
         archives = [entry for entry in sessions.list_sessions() if entry["uid"] != session.uid]
+        assert not archives and sessions.load(session.uid)["messages"] == original
+        assert session.messages[1]["content"] == medium_text
+        snapshot = sessions.load_context(session.uid)
         if outcome == "saved":
-            assert len(archives) == 1 and sessions.load(archives[0]["uid"])["messages"] == original
-            assert "Pending tests" in sessions.load(session.uid)["messages"][1]["content"]
+            assert "Pending tests" in snapshot["summary"]["current_task"]
         else:
-            assert not archives and sessions.load(session.uid)["messages"] == original
-            assert session.messages[1]["content"] == long_text
+            assert snapshot is None
 
 
 def test_stale_resume_cannot_overwrite_newer_history(project):
@@ -572,7 +581,8 @@ def test_diff_text_marks_added_rows_full_width_with_syntax_colors():
 
 def test_renderer_prints_edit_diff_with_file_header_and_colors():
     output = io.StringIO()
-    renderer = Renderer(Console(file=output, force_terminal=True, color_system="truecolor", width=100))
+    renderer = Renderer(Console(file=output, force_terminal=True, color_system="truecolor",
+                                legacy_windows=False, no_color=False, width=100))
     renderer.event({
         "type": "tool_result",
         "call": {"function": {"name": "edit_file", "arguments": "{}"}},

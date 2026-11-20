@@ -4,7 +4,7 @@ import hashlib
 import json
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urlsplit
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 import httpx
 import pytest
@@ -139,6 +139,8 @@ def test_terminal_login_and_model_search(project, monkeypatch):
 
 def test_browser_authorizes_and_lists_models(project, monkeypatch):
     authorization = {}
+    # The fixture talks directly to the loopback callback server.
+    callback_http = build_opener(ProxyHandler({}))
 
     def browser(url):
         parsed = urlsplit(url)
@@ -146,9 +148,9 @@ def test_browser_authorizes_and_lists_models(project, monkeypatch):
         authorization.update({key: values[0] for key, values in parse_qs(parsed.query).items()})
         callback = authorization["callback_url"]
         with pytest.raises(HTTPError, match="400"):
-            urlopen(callback + "?code=discard&state=wrong", timeout=2)
+            callback_http.open(callback + "?code=discard&state=wrong", timeout=2)
         query = urlencode({"code": "one-time-code", "state": authorization["state"]})
-        with urlopen(callback + "?" + query, timeout=2) as response:
+        with callback_http.open(callback + "?" + query, timeout=2) as response:
             assert response.status == 200
         return True
 

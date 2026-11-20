@@ -9,6 +9,7 @@ import threading
 import webbrowser
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -137,6 +138,12 @@ async def openrouter_login(show_url, *, timeout=180):
         if not received.done():
             received.set_result(code)
 
+    class LoopbackServer(ThreadingHTTPServer):
+        def server_bind(self):
+            # The callback URL uses the loopback IP, so binding needs no reverse DNS lookup.
+            TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address
+
     class Callback(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
@@ -168,7 +175,7 @@ async def openrouter_login(show_url, *, timeout=180):
             self.wfile.write(message)
 
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Callback)
+        server = LoopbackServer(("127.0.0.1", 0), Callback)
     except OSError:
         raise ValueError("无法启动本地浏览器回调。请重试或使用 API Key。") from None
     with server:

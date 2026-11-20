@@ -464,29 +464,31 @@ def test_print_entry_point_reports_json_and_persists(project, monkeypatch, capsy
         assert session.messages[-1]["content"] == "Visible result."
 
 
-def test_terminal_accepts_prompt_approval_and_exit(project):
+def test_terminal_accepts_prompt_approval_and_exit(project, capsys):
     replies = iter([ModelReply(tool_calls=[call("write_file", file_path="result.txt", content="ok")]),
                     ModelReply(text="Done.")])
 
     async def exercise():
         with create_pipe_input() as pipe, Session(project, model=lambda *_: next(replies)) as session:
             terminal = asyncio.create_task(interactive(session, terminal_input=pipe, terminal_output=DummyOutput()))
-            await asyncio.sleep(0.1)
-            pipe.send_text("Write the file\r")
-            for _ in range(100):
-                if session.busy and session.transcript and session.transcript[-1]["type"] == "tool_request":
-                    break
-                await asyncio.sleep(0.02)
-            await asyncio.sleep(0.15)
-            pipe.send_text("y\r")
-            for _ in range(100):
-                if session.last_result:
-                    break
-                await asyncio.sleep(0.02)
-            pipe.send_text("/exit\r")
-            await asyncio.wait_for(terminal, timeout=3)
-            assert session.last_result and session.last_result["status"] == "completed"
-            assert (project / "result.txt").read_text(encoding="utf-8") == "ok"
+            try:
+                pipe.send_text("Write the file\r")
+                # The tool request is emitted before the terminal can accept approval.
+                async with asyncio.timeout(15):
+                    while "y 允许一次" not in capsys.readouterr().out:
+                        await asyncio.sleep(0.02)
+                pipe.send_text("y\r")
+                async with asyncio.timeout(15):
+                    while session.last_result is None:
+                        await asyncio.sleep(0.02)
+                pipe.send_text("/exit\r")
+                assert await asyncio.wait_for(terminal, timeout=10) == 0
+                assert session.last_result["status"] == "completed"
+                assert (project / "result.txt").read_text(encoding="utf-8") == "ok"
+            finally:
+                if not terminal.done():
+                    terminal.cancel()
+                    await asyncio.gather(terminal, return_exceptions=True)
 
     asyncio.run(exercise())
 

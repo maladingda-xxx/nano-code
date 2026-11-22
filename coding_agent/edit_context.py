@@ -11,11 +11,12 @@ def current_edit_context() -> dict | None:
 
 
 @contextmanager
-def edit_scope(session_id=None, turn_id=None, tool_call_id=None):
+def edit_scope(session_id=None, turn_id=None, tool_call_id=None, round=None):
     token = _current.set({
         "session_id": session_id,
         "turn_id": turn_id,
         "tool_call_id": tool_call_id,
+        "round": round,
     })
     try:
         yield

@@ -34,10 +34,11 @@ from execution_store import (
     execution_session, pending_executions, record_execution, recover_execution,
 )
 from model_api import ChatModel
+from file_state import UnchangedOutput
 from session_store import (
     auto_save, list_saved_sessions, load_session_record, save_session,
 )
-from tools import AVAILABLE_TOOLS, TOOLS, run_command, set_workspace_root
+from tools import AVAILABLE_TOOLS, TOOLS, check_file_edit_access, run_command, set_workspace_root
 from workspace import find_root, read_project_instructions
 
 
@@ -345,6 +346,7 @@ def build_system_prompt(root: Path, directory: Path) -> str:
 {detect_project(root)}
 
 先收集上下文，再修改，再验证。使用 search_workspace 定位代码，使用 read_file 检查原文。
+修改已有文件前必须先 read_file；覆盖或追加已有文件前需要完整读取。读取后文件发生变化时必须重新读取。
 修改已有代码优先使用 edit_file，创建文件可用 write_file。文件工具的相对路径以仓库根目录为基准。
 已经定位到具体文件和修改点后，优先提交最小改动，不要反复读取同一文件或继续扩展调查。
 工具轮数有限。收到剩余轮数提示时，不要再扩大调查范围；能修改就立即修改，不能修改就说明当前结论。
@@ -364,6 +366,7 @@ def build_system_prompt(root: Path, directory: Path) -> str:
 def execute_tool_call(
     call: dict, emit: EventHandler | None = None, *,
     confirm=None, interactive: bool = False, command_timeout: float = 60,
+    enforce_read_state: bool = False,
 ) -> ToolResult:
     name = call["function"]["name"]
     if name not in AVAILABLE_TOOLS:
@@ -378,6 +381,10 @@ def execute_tool_call(
         arguments = json.loads(call["function"]["arguments"])
         if not isinstance(arguments, dict):
             raise ToolInputError("工具参数必须是 JSON 对象。")
+        if enforce_read_state and name in {"edit_file", "write_file"}:
+            problem = check_file_edit_access(name, arguments)
+            if problem:
+                return ToolResult(problem, status="blocked")
         if name == "execute_command":
             flag = arguments.pop("verification", False)
             if not isinstance(flag, bool):
@@ -391,8 +398,10 @@ def execute_tool_call(
                 on_output=on_output if emit else None,
             )
         else:
+            raw = AVAILABLE_TOOLS[name](**arguments)
             result = ToolResult(
-                AVAILABLE_TOOLS[name](**arguments),
+                str(raw),
+                status="unchanged" if isinstance(raw, UnchangedOutput) else "ok",
                 invalidates_verification=name in {"edit_file", "write_file"},
             )
     except KeyboardInterrupt:
@@ -625,7 +634,8 @@ def _interactive_dispatch(command_timeout: float):
             approvals[key] = answer == "y"
         return approvals[key]
 
-    return partial(execute_tool_call, confirm=confirm, interactive=True, command_timeout=command_timeout)
+    return partial(execute_tool_call, confirm=confirm, interactive=True,
+                   command_timeout=command_timeout, enforce_read_state=True)
 
 
 def _run_interactive(
@@ -820,7 +830,8 @@ def main(argv: list[str] | None = None) -> int:
     session_uid = uuid4().hex
     status = run_turn(
         messages, args.prompt, request_model=model,
-        dispatch_with_events=partial(execute_tool_call, confirm=confirm, command_timeout=command_timeout),
+        dispatch_with_events=partial(execute_tool_call, confirm=confirm,
+                                     command_timeout=command_timeout, enforce_read_state=True),
         emit=emit, max_tool_rounds=max_rounds,
         session_id=session_uid, checkpoint=record_execution,
     )

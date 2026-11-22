@@ -145,7 +145,7 @@ def run_turn(
                 tool_scope = {"call": public_tool_call(call), "tool_call_id": call["id"], "round": round_number + 1}
                 publish({"type": "tool_request", **tool_scope}, durable=True)
                 started = perf_counter()
-                with edit_scope(scope["session_id"], scope["turn_id"], call["id"]):
+                with edit_scope(scope["session_id"], scope["turn_id"], call["id"], round_number + 1):
                     if dispatch_with_events is not None:
                         def publish_tool(event: dict) -> None:
                             publish({**event, "tool_call_id": call["id"], "round": round_number + 1})

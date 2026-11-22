@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import cache
 from itertools import chain
 
+import file_state
+
 from exceptions import ContextBudgetError
 
 DEFAULT_MAX_OUTPUT = 4096
@@ -119,6 +121,11 @@ def _tool_batches(messages: list[dict]) -> list[list[dict]]:
 def _fit_latest_batch(batch: list[dict], available: int, model: str) -> list[dict] | None:
     if estimate_tokens(batch, model) <= available:
         return batch
+    calls = {}
+    for message in batch:
+        if message["role"] == "assistant":
+            for call in message.get("tool_calls", ()):
+                calls[call.get("id")] = call.get("function", {})
     max_length = max(
         (len(message["content"]) for message in batch
          if message["role"] in {"assistant", "tool"} and isinstance(message.get("content"), str)),
@@ -132,6 +139,8 @@ def _fit_latest_batch(batch: list[dict], available: int, model: str) -> list[dic
             content = message.get("content")
             if (message["role"] == "tool" or message["role"] == "assistant" and not message.get("tool_calls")
                 and not message.get("reasoning_content")) and isinstance(content, str) and len(content) > max_length:
+                if message["role"] == "tool":
+                    _invalidate_read(calls.get(message.get("tool_call_id")))
                 label = "工具输出" if message["role"] == "tool" else "回复内容"
                 content = content[:head] + f"\n[{label}已压缩]\n" + content[-head:]
                 message = {**message, "content": content}
@@ -149,7 +158,37 @@ def _keep_suffix(blocks: list[list[dict]], available: int, model: str) -> tuple[
             break
         available -= cost
         first -= 1
+    _invalidate_blocks(blocks[:first])
     return blocks[first:], available
+
+
+def _invalidate_blocks(blocks: list[list[dict]]) -> None:
+    for block in blocks:
+        for message in block:
+            if message["role"] == "tool":
+                _invalidate_read(_call_for(message, block))
+
+
+def _call_for(tool_message: dict, block: list[dict]) -> dict | None:
+    for message in block:
+        if message["role"] != "assistant":
+            continue
+        for call in message.get("tool_calls", ()):
+            if call.get("id") == tool_message.get("tool_call_id"):
+                return call.get("function", {})
+    return None
+
+
+def _invalidate_read(function: dict | None) -> None:
+    if not isinstance(function, dict) or function.get("name") != "read_file":
+        return
+    try:
+        arguments = json.loads(function.get("arguments", "{}"))
+    except (TypeError, ValueError):
+        return
+    path = arguments.get("file_path") if isinstance(arguments, dict) else None
+    if isinstance(path, str):
+        file_state.invalidate(path)
 
 
 def fit_request(
@@ -178,7 +217,12 @@ def fit_request(
         )
     available -= estimate_tokens(latest, model)
     kept_blocks, available = _keep_suffix(blocks, available, model)
-    kept_turns, _ = _keep_suffix(turns[:-1], available, model) if len(kept_blocks) == len(blocks) else ([], 0)
+    if len(kept_blocks) == len(blocks):
+        kept_turns, _ = _keep_suffix(turns[:-1], available, model)
+    else:
+        # All earlier turns are dropped; their read results are no longer visible.
+        _invalidate_blocks(turns[:-1])
+        kept_turns = []
     fitted = [
         *instructions, *chain.from_iterable(kept_turns), *user,
         *chain.from_iterable(kept_blocks), *latest,

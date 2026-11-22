@@ -3,6 +3,8 @@
 import json
 import re
 
+import file_state
+
 ERROR_LINE = re.compile(r"traceback|\b(?:fail(?:ed|ure)?|error|exception|fatal|denied|timeout)\b|错误|失败|退出码", re.I)
 CREDENTIAL = re.compile(
     r"\bBearer\s+[\w.~-]{8,}|\b(?:sk-|gh[opsu]_|github_pat_)[\w-]{8,}|"
@@ -63,6 +65,11 @@ def prune_results(
                     arguments = {}
                 path = arguments.get("file_path") if isinstance(arguments, dict) else None
                 label = f"{name} {path[:160]}" if isinstance(path, str) else (name or "tool")
+                if name == "read_file" and isinstance(path, str):
+                    # The full read is no longer visible in the request view;
+                    # never answer a later read with "unchanged" or let an edit
+                    # rely on stale read state.
+                    file_state.invalidate(path)
                 safe = (
                     f"[read_tool_output reference {index}]\n"
                     f"[{mask_credentials(label)}: output shortened. Page the recorded text using the reference.]\n"

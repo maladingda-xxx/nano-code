@@ -20,6 +20,7 @@ from pathlib import Path
 from agent_core import ToolResult
 from changes import read_bytes, record_edit
 from command_runner import run_process
+import file_state
 from session_store import set_session_root
 from workspace import workspace_path
 
@@ -48,8 +49,17 @@ _workspace_root = Path.cwd().resolve()
 
 def set_workspace_root(path: str | Path) -> None:
     global _workspace_root
-    _workspace_root = Path(path).resolve()
+    resolved = Path(path).resolve()
+    if resolved != _workspace_root:
+        # A different workspace must not reuse read state from the old one.
+        file_state.reset_all()
+    _workspace_root = resolved
     set_session_root(_workspace_root)
+
+
+def check_file_edit_access(name: str, arguments: dict) -> str | None:
+    """Dispatcher hook: enforce read-before-edit for product entry points."""
+    return file_state.check_edit_access(name, arguments, _workspace_root)
 
 
 def _format_size(size_bytes: int) -> str:
@@ -84,6 +94,18 @@ def read_file(
     page_size = limit or (500 if line_end is not None else 200)
     end = min(start + page_size - 1, line_end) if line_end is not None else start + page_size - 1
     check_more = line_end is None or end < line_end
+
+    if file_state.is_unchanged(path, start_line=start, end_line=end):
+        return file_state.UnchangedOutput(
+            f"文件未变化，内容同上（{file_path}，第 {start}-{end} 行）。"
+            "若上一条读取结果已被上下文裁剪，请重新调用 read_file。"
+        )
+
+    try:
+        before_stat = path.stat()
+    except OSError as error:
+        raise ToolExecutionError(f"读取文件失败 —— {file_path}，详情: {error}", tool_name="read_file") from error
+
     try:
         for encoding in ("utf-8", "latin-1"):
             try:
@@ -96,9 +118,15 @@ def read_file(
         raise ToolExecutionError(f"读取文件失败 —— {file_path}，详情: {error}", tool_name="read_file") from error
     if not lines:
         if start == 1:
+            _record_read_if_stable(path, start, end, True, before_stat)
             return "文件为空。"
         raise ToolInputError(f"起始行 {start} 超出文件范围。", tool_name="read_file")
     page = lines[:end - start + 1]
+    # A plain read from line 1 that reached EOF is a full view. Reads using an
+    # explicit line_end are treated as partial even if they happen to reach EOF,
+    # because the tool did not verify what follows the requested range.
+    full_read = start == 1 and line_end is None and len(page) == len(lines)
+    _record_read_if_stable(path, start, end, full_read, before_stat)
     result = []
     for number, line in enumerate(page, start):
         content = line.rstrip("\r\n")
@@ -106,6 +134,17 @@ def read_file(
     if len(page) < len(lines):
         result.append(f"（{file_path} 还有更多内容，请从 line_start={end + 1} 或 offset={end} 继续读取。）")
     return "\n".join(result)
+
+
+def _record_read_if_stable(path: Path, start: int, end: int, full_read: bool, before) -> None:
+    """Record state only when the file did not change while it was being read."""
+    try:
+        after = path.stat()
+    except OSError:
+        return
+    if (after.st_mtime_ns, after.st_size) != (before.st_mtime_ns, before.st_size):
+        return
+    file_state.record_read(path, start_line=start, end_line=end, full_read=full_read)
 
 
 # ============================================================
@@ -346,10 +385,12 @@ def edit_file(file_path: str, old_text: str, new_text: str) -> str:
     if original.find(old_text, start + 1) >= 0:
         raise ToolInputError("原文匹配多处，请提供更多上下文。", tool_name=tool)
     if old_text == new_text:
+        file_state.record_written(path)
         return "内容相同，无需修改。"
 
     edited = original[:start] + new_text + original[start + len(old_text):]
     record_edit(_workspace_root, path, before, edited.encode("utf-8"), tool)
+    file_state.record_written(path)
     diff = _edit_diff(path, original, edited)
     return f"已编辑 {path.relative_to(_workspace_root).as_posix()}\n{diff}".rstrip()
 
@@ -454,6 +495,7 @@ def write_file(file_path: str, content: str, mode: str = "overwrite") -> str:
     if mode == "append" and before is not None:
         data = before + data
     record_edit(_workspace_root, path, before, data, tool)
+    file_state.record_written(path)
     summary = f"已写入 {path.relative_to(_workspace_root).as_posix()}（{len(data)} 字节）"
     before_text, readable = None, True
     if before is not None:
@@ -632,7 +674,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "在现有 UTF-8 文件中替换唯一匹配的原文并返回 diff。修改已有代码时优先使用。",
+            "description": "在现有 UTF-8 文件中替换唯一匹配的原文并返回 diff。修改已有代码时优先使用；编辑前需先 read_file，读取后文件变化时需重新读取。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -677,6 +719,7 @@ TOOLS: list[dict] = [
             "description": (
                 "将内容写入文件。支持两种模式：'overwrite'（覆盖整个文件）和 'append'（追加到文件末尾）。"
                 "写入前会检查路径并记录快照。修改已有代码时优先使用 edit_file。"
+                "覆盖或追加已有文件前需要完整读取；新建文件不需要预先读取。"
                 "只能写入工作区内的文件，不能使用 ../ 跳出项目根目录。"
             ),
             "parameters": {

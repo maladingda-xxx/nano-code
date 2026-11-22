@@ -205,6 +205,7 @@ class Renderer:
             self.output.append(event)
             content = safe_text(event["result"])
             status = event["outcome"]["status"]
+            ok = status in {"ok", "unchanged"}
             name = event["call"]["function"]["name"]
             files = parse_diff(content) if name in {"edit_file", "write_file"} else []
             if files:
@@ -220,10 +221,10 @@ class Renderer:
                 if total > shown:
                     self.console.print(Text(f"     … 还有 {total - shown} 行 · /output 展开", style="dim"))
             elif self.expanded:
-                self.console.print(Text(content, style="dim" if status == "ok" else WARNING))
+                self.console.print(Text(content, style="dim" if ok else WARNING))
             else:
                 lines = content.splitlines()
-                self.console.print(Text("  ⎿  " + (lines[0][:160] if lines else status), style="dim" if status == "ok" else WARNING))
+                self.console.print(Text("  ⎿  " + (lines[0][:160] if lines else status), style="dim" if ok else WARNING))
                 if len(lines) > 1:
                     self.console.print(Text(f"     +{len(lines)-1} lines · /output 展开", style="dim"))
         elif kind in {"error", "notice", "recovery_error"}:

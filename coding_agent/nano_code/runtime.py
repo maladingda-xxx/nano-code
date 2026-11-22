@@ -17,6 +17,7 @@ from uuid import uuid4
 
 import agent
 import tools as builtins
+import file_state
 from agent_core import ModelReply, ToolResult, run_turn
 from cancellation import cancellation_scope, check_cancelled
 from exceptions import ToolError
@@ -185,6 +186,9 @@ class Session:
                                  lambda snapshot: sessions.save_context(self.uid, snapshot),
                                  trigger="automatic", allow_tools=allow_tools, output=self._output_target())
             if self.context.snapshot is not before:
+                # The compacted view may have dropped the earlier read result;
+                # require a fresh read before editing.
+                file_state.reset_session(self.uid)
                 view, count = self._context_view(messages, allow_tools)
                 budget = self.context_budget(view, allow_tools)
         self.last_context_budget = budget
@@ -407,6 +411,8 @@ class Session:
             raise ValueError("该会话已由另一进程更新。请先 /resume 重新加载，或 /fork 保留本地分支。")
 
     def restore_context(self):
+        # A resumed/forked view may not contain the earlier read results.
+        file_state.reset_session(self.uid)
         self.context.snapshot = ContextSnapshot.restore(sessions.load_context(self.uid), self.messages)
         self.context.attempted = 0
         self.context.working_facts = ""
@@ -553,7 +559,8 @@ class Session:
                 result = ToolResult(json.dumps(response, ensure_ascii=False)[:16000], status="error" if response.get("isError") else "ok")
             else:
                 result = agent.execute_tool_call(call, emit, confirm=lambda argv, cwd: True,
-                    command_timeout=self.config.data["command_timeout"])
+                    command_timeout=self.config.data["command_timeout"],
+                    enforce_read_state=True)
             if instructions:
                 from dataclasses import replace
                 result = replace(result, text="目录约定：\n" + instructions + "\n\n" + result.text)
@@ -657,8 +664,13 @@ class Session:
                             raise NotImplementedError
                         return method(messages, emit)
 
-                    return self.context.compact(self.messages, summarize, self._emit, commit,
-                                                trigger="manual", focus=focus, output=self._output_target())
+                    before = self.context.snapshot
+                    result = self.context.compact(self.messages, summarize, self._emit, commit,
+                                                  trigger="manual", focus=focus, output=self._output_target())
+                    if self.context.snapshot is not before:
+                        # The compacted view may have dropped read results.
+                        file_state.reset_session(self.uid)
+                    return result
         finally:
             self.busy = False
 

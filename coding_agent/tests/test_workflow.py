@@ -472,7 +472,7 @@ def test_incomplete_stream_never_commits_reply_or_dispatches_tool(workspace, end
         save=session_store.auto_save,
     )
     assert status == "error"
-    assert len(requests) == 1
+    assert len(requests) == (2 if ending == "length" else 1)
     assert events[-1]["reason"] == reason
     assert any(event["type"] == "text_delta" for event in events)
     assert all(event["type"] not in {"reply", "tool_request"} for event in events)
@@ -499,6 +499,22 @@ def test_request_failure_falls_back_and_checks_final_reply(finish_reason, status
     ) == status
     assert events[-1]["reason"] == reason
     assert any(event["type"] == "reply" for event in events) == (status == "completed")
+
+
+def test_output_recovery_counts_against_model_request_limit(workspace):
+    def handler(request):
+        assert json.loads(request.content)["tools"]
+        return _completion("unfinished", "length")
+
+    model = _mock_model(handler)
+    model.request_limit = 1
+    events = []
+    assert run_turn(
+        [], "hello", request_model=model, dispatch=agent.execute_tool_call,
+        emit=events.append, max_tool_rounds=2,
+    ) == "error"
+    assert model.requests_sent == 1
+    assert events[-1]["reason"] == "model_request_budget_exceeded"
 
 
 def test_invalid_tool_arguments_are_reported_to_model(workspace):

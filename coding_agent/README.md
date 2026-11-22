@@ -17,7 +17,7 @@ API Key / Token 支持 DeepSeek、OpenAI、Anthropic Claude、Google Gemini、Op
 
 登录凭据以明文文件保存在本机用户目录 `~/.nano-code/nano-provider-credentials/`。若设置了 `NANO_CODE_HOME`，则保存在对应目录下。重启后登录仍可使用，模型需在当前进程中选择。
 
-需要使用旧版或脚本配置时，将 [.env.example](.env.example) 复制到自己管理的位置并填入 `API_KEY`。官方 DeepSeek 默认使用 `deepseek-flash`，工具调用采用非思考模式。可用 `MODEL_NAME` 和 `BASE_URL` 指定其他兼容服务。已有环境变量优先于配置文件。 [DeepSeek 模型与工具调用](https://api-docs.deepseek.com/guides/tool_calls/)
+需要使用旧版或脚本配置时，将 [.env.example](.env.example) 复制到自己管理的位置并填入 `API_KEY`。官方 DeepSeek 默认使用 `deepseek-flash`。`nano-code` 直连时，`auto` 使用官方默认思考档 `high`，可选 `none` 关闭思考。可用 `MODEL_NAME` 和 `BASE_URL` 指定其他兼容服务。已有环境变量优先于配置文件。 [DeepSeek 模型与工具调用](https://api-docs.deepseek.com/guides/tool_calls/)
 
 ```sh
 nano-code --env-file /path/to/nano.env

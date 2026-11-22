@@ -64,6 +64,118 @@ def attach_chat_transport(model, handler):
     client.close()
 
 
+@pytest.mark.parametrize(("streaming", "effort", "output", "retry_output"), [
+    (False, "auto", 65_536, 131_072),
+    (True, "max", 131_072, 250_000),
+])
+def test_deepseek_continues_interrupted_edit_and_verifies(project, streaming, effort, output, retry_output):
+    config = config_for(project)
+    config.data.update(context_limit=1_000_000, effort=effort, streaming=streaming, max_turns=4,
+                       permission_mode="default")
+    config.data.pop("request_limit", None)
+    path = project / "example.txt"
+    path.write_text("before", encoding="utf-8")
+    command = ["python", "-c", "from pathlib import Path; assert Path('example.txt').read_text() == 'after'"]
+    calls = iter([
+        ("read", "read_file", '{"file_path":"example.txt"}', "tool_calls"),
+        ("partial", "write_file", '{"file_path":"unexpected.txt","content":', "length"),
+        ("edit", "edit_file", '{"file_path":"example.txt","old_text":"before","new_text":"after"}', "tool_calls"),
+        ("verify", "execute_command", json.dumps({"argv": command, "verification": True}), "tool_calls"),
+    ])
+    requests, events = [], []
+
+    def chat(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if action := next(calls, None):
+            call_id, name, arguments, reason = action
+            call = {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+            if streaming:
+                call["index"] = 0
+            message = {"tool_calls": [call], "reasoning_content": "provider state " + call_id}
+        else:
+            message, reason = {"content": "Verified."}, "stop"
+        response = chat_response(body["model"], message, reason)
+        if streaming:
+            response["object"] = "chat.completion.chunk"
+            choice = response["choices"][0]
+            choice["delta"] = choice.pop("message")
+            return sse_response([response])
+        return httpx.Response(200, json=response)
+
+    with Session(project, config=config, emit=events.append, ask=lambda *_: True) as session:
+        assert session.context_budget(session.messages).reserved_output == output
+        attach_chat_transport(session.ensure_model(), chat)
+        result = session.run("Update example.txt and verify the result.")
+        session.resume(session.uid)
+        assert all(not message.get("_runtime_notice") for message in session.messages)
+        assert session.messages[-1]["content"] == "Verified."
+
+    assert result["status"] == "completed"
+    assert result["reason"] == "reply"
+    assert result["verification"]["status"] == "passed"
+    assert result["tool_calls"] == 3
+    assert path.read_text(encoding="utf-8") == "after"
+    assert not (project / "unexpected.txt").exists()
+    assert [event["tool_call_id"] for event in events if event["type"] == "tool_request"] == ["read", "edit", "verify"]
+    expected_outputs = [output, output, retry_output, output, output]
+    assert [body["max_tokens"] for body in requests] == expected_outputs
+    assert [event["max_output_tokens"] for event in events if event["type"] == "model_request"] == expected_outputs
+    assert all(body["thinking"] == {"type": "enabled"} for body in requests)
+    assert {body["reasoning_effort"] for body in requests} == {"high" if effort == "auto" else effort}
+    assert requests[2]["messages"][:-1] == requests[1]["messages"]
+    assert requests[2]["messages"][-2]["tool_call_id"] == "read"
+    assert requests[2]["messages"][-3]["reasoning_content"] == "provider state read"
+    assert requests[2]["messages"][-1]["role"] == "user"
+    assert "_output_retry" not in requests[2]["messages"][-1]
+
+
+def test_deepseek_none_uses_non_thinking_budget(project):
+    def chat(request):
+        body = json.loads(request.content)
+        assert body["thinking"] == {"type": "disabled"}
+        assert body["max_tokens"] == 8_192
+        return httpx.Response(200, json=chat_response(body["model"], {"content": "Done."}))
+
+    with Session(project, config=config_for(project)) as session:
+        session.set_effort("none")
+        attach_chat_transport(session.ensure_model(), chat)
+        assert session.run("Reply with a short acknowledgement.")["status"] == "completed"
+
+
+def test_anthropic_recovers_from_truncated_streaming_tool_arguments(project):
+    config = Config(project, overrides={"provider": "anthropic", "model": "claude-test", "streaming": True})
+    requests = []
+
+    def chat(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            events = [
+                {"type": "content_block_start", "index": 0, "content_block": {
+                    "type": "tool_use", "id": "partial", "name": "write_file", "input": {},
+                }},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "input_json_delta", "partial_json": '{"file_path":'}},
+            ]
+            reason = "max_tokens"
+        else:
+            events = [{"type": "content_block_start", "index": 0,
+                       "content_block": {"type": "text", "text": "Recovered."}}]
+            reason = "end_turn"
+        return sse_response([*events, {"type": "message_delta", "delta": {"stop_reason": reason}},
+                             {"type": "message_stop"}])
+
+    with Session(project, config=config) as session:
+        model = session.ensure_model()
+        model.client.close()
+        model.client = httpx.Client(transport=httpx.MockTransport(chat))
+        result = session.run("Test recovery")
+        assert session.messages[-1]["content"] == "Recovered."
+    assert result["status"] == "completed"
+    assert result["tool_calls"] == 0
+    assert len(requests) == 2
+
+
 class Capture(DummyOutput):
     def __init__(self):
         self.text = ""

@@ -14,7 +14,7 @@ from .provider_profiles import LoginStore, PROVIDERS, valid_model_id
 DEFAULTS = {
     "provider": "openai", "model": "deepseek-flash", "base_url": "https://api.deepseek.com",
     "models": [], "effort": "auto",
-    "api_key_env": "API_KEY", "permission_mode": "default", "max_turns": 24,
+    "api_key_env": "API_KEY", "permission_mode": "default", "max_turns": 64,
     "context_limit": 80000, "command_timeout": 120, "request_timeout": 60,
     "context_models": {}, "context_safety_tokens": 512, "context_tool_result_chars": 3600,
     "context_prune_at": 0.60, "context_compact_at": 0.75, "context_auto_compact": True,

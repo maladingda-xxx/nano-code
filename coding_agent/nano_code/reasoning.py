@@ -13,7 +13,8 @@ _OFFICIAL_ENDPOINTS = {
 _LOW_HIGH_MAX = ("low", "high", "max")
 _LOW_TO_HIGH = ("low", "medium", "high")
 _FAMILY_LEVELS = {
-    "deepseek": ((r"deepseek-(?:flash|v4(?:\.\d+)?-(?:flash|pro))(?:-\d+)?", _LOW_HIGH_MAX),),
+    "deepseek": ((r"deepseek-(?:flash|v4(?:\.\d+)?-(?:flash(?:-vision-exp)?|pro))(?:-\d+)?",
+                  (*_LOW_HIGH_MAX, "none")),),
     "kimi": ((r"kimi-k3(?:\.\d+)?(?:-[a-z0-9]+)*", _LOW_HIGH_MAX),),
     "gemini": (
         (r"gemini-4-(?:neon|hydrogen)(?:-[a-z0-9]+)*", (*_LOW_TO_HIGH, "xhigh")),

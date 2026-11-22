@@ -51,6 +51,71 @@ def test_pruning_keeps_failure_and_reference_without_mutating_history():
     assert "routine log line" in read_output(history, "2", 0, 50)
 
 
+def _batch(*entries):
+    calls = [{"id": call_id, "type": "function",
+              "function": {"name": name, "arguments": json.dumps(arguments)}}
+             for call_id, name, arguments, _ in entries]
+    return [{"role": "assistant", "content": None, "tool_calls": calls}, *[
+        {"role": "tool", "tool_call_id": call_id, "content": content}
+        for call_id, _, _, content in entries
+    ]]
+
+
+def test_folded_batches_keep_references_across_compaction_and_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("NANO_CODE_HOME", str(tmp_path / "settings"))
+    config = Config(tmp_path, overrides={"context_limit": 24000, "context_prune_at": 0.15,
+                                         "context_compact_at": 0.9, "context_auto_compact": False})
+    read = "start of file\n" + "recorded source row\n" * 100
+    search = "match in src/settings.py\n" * 95
+    latest = _batch(("latest", "read_file", {"file_path": "recent.py"}, read),
+                    ("also-latest", "glob_files", {"pattern": "*.py"}, search))
+    tail = [
+        {"role": "user", "content": "Keep the early regression and both reads available."},
+        *_batch(
+            ("old-read", "read_file", {"file_path": "settings.py"}, read),
+            ("old-search", "search_workspace", {"query": "setting", "dir_path": "src"}, search),
+            ("failure", "execute_command", {"argv": ["pytest"]}, tool_history()[-1]["content"]),
+        ),
+        *latest,
+    ]
+    model = SummaryModel()
+    with Session(tmp_path, config=config, model=model) as session:
+        session.messages.extend([
+            {"role": "user", "content": "Earlier request."},
+            {"role": "assistant", "content": "Earlier working evidence. " * 700},
+            *tail,
+        ])
+        raw = session.messages.copy()
+        view, stats = session._context_view(raw)
+        assert stats.folded_results == 2
+        assert "→" in session.compact()
+        assert session.messages == raw
+        assert session.context.snapshot.end == 2
+        uid = session.uid
+
+    install_notice = {"role": "user", "content": "Internal notice", "_runtime_notice": True}
+    with Session(tmp_path, config=config, model=model, resume=uid) as resumed:
+        messages = [*resumed.messages[:4], install_notice, *resumed.messages[4:]]
+        view, stats = resumed._context_view(messages)
+        assert stats.folded_results == 2
+        results = {entry["tool_call_id"]: entry["content"] for entry in view if entry["role"] == "tool"}
+        assert [call["id"] for entry in view for call in entry.get("tool_calls", ())] == list(results)
+        assert "reference 4" in results["old-read"] and "read_file settings.py" in results["old-read"]
+        assert "reference 5" in results["old-search"] and "search_workspace src (setting)" in results["old-search"]
+        assert results["latest"] == read and results["also-latest"] == search
+        assert "exit code: 1" in results["failure"] and "test_regression.py::test_bug" in results["failure"]
+        assert read_output(messages, "4", 14, 30).split("\n", 1)[1] == read[14:44]
+        assert read_output(messages, "5", 24, 10).split("\n", 1)[1] == search[24:34]
+        resumed._request(messages, True, resumed._emit)
+        assert resumed.context_stats["folded_results"] == 2
+
+    roomy_config = Config(tmp_path, overrides={"context_limit": 80000})
+    with Session(tmp_path, config=roomy_config, model=model) as roomy:
+        view, stats = roomy._context_view([roomy.messages[0], *tail])
+        assert stats.folded_results == 0
+        assert next(m for m in view if m.get("tool_call_id") == "old-read")["content"] == read
+
+
 def test_chat_usage_reports_cache_and_reasoning_as_subsets():
     events = []
     tracker = RequestUsage(events.append)
@@ -134,6 +199,39 @@ def test_selects_relevant_memory_and_skips_stale_sections(tmp_path):
     selected = project_memory(tmp_path, "Update SQL database migration")
     assert "write-ahead" in selected and "verified 2026-10-01" in selected
     assert "Deprecated" not in selected and "Campaign" not in selected
+
+
+def test_memory_ranks_paths_and_bilingual_descriptions(tmp_path):
+    memory = tmp_path / ".nano" / "MEMORY.md"
+    memory.parent.mkdir()
+    memory.write_text(
+        "## Router [stale]\nDescription: Checkout request retry / 结账请求重试\n"
+        "Paths: src/checkout\nUse the retired contract.\n"
+        "## Reconciliation\nDescription: Checkout request retry / 结账请求重试\n"
+        "Paths: src/checkout_archive\nArchive only.\n"
+        "## Storage\nDescription: Checkout request retry / 结账请求重试\n"
+        "Paths: src/store\nUse the storage retry.\n"
+        "## Reports\nDescription: Checkout request retry / 结账请求重试\n"
+        "Paths: src/reports\nReporting only.\n"
+        "## Active routing\nDescription: Checkout request retry / 结账请求重试\n"
+        "Paths: src/checkout, tests/checkout\nUpdated: 2026-11-19\n"
+        "Use the shared backoff. password=sample-secret\n"
+        "## Request boundaries\n描述：结账请求退避 / Checkout retry backoff\n"
+        "适用路径：src/checkout/routes.py\nRetry on a transient failure.\n",
+        encoding="utf-8",
+    )
+    for task in ("Tighten checkout request retry in `src/checkout/routes.py`.",
+                 "调整 `src\\checkout\\routes.py` 的结账请求重试。"):
+        notes = project_memory(tmp_path, task)
+        assert notes.count("## ") == 3
+        assert {section.splitlines()[0] for section in notes.split("\n\n")[:2]} == {
+            "## Active routing", "## Request boundaries",
+        }
+        assert "Request boundaries" in notes and "Use the shared backoff" in notes
+        assert "retired contract" not in notes
+        assert "Updated: 2026-11-19" in notes and "[REDACTED]" in notes and "sample-secret" not in notes
+    assert project_memory(tmp_path, "调整结账请求退避").startswith("## Request boundaries")
+    assert project_memory(tmp_path, "Calibrate typography kerning in src/fonts/glyph.py / 调整字体字距") == ""
 
 
 def test_anthropic_cached_input_counts_once():

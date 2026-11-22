@@ -297,6 +297,30 @@ def test_pruned_read_result_invalidates_state(workspace):
         assert file_state.lookup(path) is None
 
 
+def test_folded_read_expires_old_state_without_discarding_a_fresh_read(workspace):
+    path = workspace / "file.txt"
+    path.write_text("before\n" + "routine source text\n" * 110, encoding="utf-8")
+    with edit_scope("session", "turn", "old-read", 1):
+        previous = tools.read_file("file.txt")
+    old = [{"role": "assistant", "tool_calls": [call("old-read", "read_file", file_path="file.txt")]},
+           {"role": "tool", "tool_call_id": "old-read", "content": previous}]
+    latest = [{"role": "assistant", "tool_calls": [call("search", "search_workspace", query="before")]},
+              {"role": "tool", "tool_call_id": "search", "content": "a match"}]
+    prune_results([*old, *latest], cap=4000, aggressive=True)
+    with edit_scope("session", "turn", "repeat", 3):
+        assert not isinstance(fresh := tools.read_file("file.txt"), file_state.UnchangedOutput)
+    latest = [{"role": "assistant", "tool_calls": [call("repeat", "read_file", file_path="file.txt")]},
+              {"role": "tool", "tool_call_id": "repeat", "content": fresh}]
+    prune_results([*old, *latest], cap=4000, aggressive=True)
+    with edit_scope("session", "turn", "edit", 4):
+        result = agent.execute_tool_call(
+            call("edit", "edit_file", file_path="file.txt", old_text="before", new_text="after"),
+            enforce_read_state=True,
+        )
+    assert result.status == "ok"
+    assert path.read_text(encoding="utf-8").startswith("after\n")
+
+
 def test_reset_session_forces_a_new_read(workspace):
     path = workspace / "file.txt"
     path.write_text("before\n", encoding="utf-8")

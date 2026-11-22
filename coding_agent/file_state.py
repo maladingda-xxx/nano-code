@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from edit_context import current_edit_context
@@ -44,6 +44,8 @@ class FileState:
     full_read: bool
     turn_id: str | None
     round_id: int | None
+    tool_call_id: str | None = None
+    full_read_call_id: str | None = None
 
 
 class FileStateCache:
@@ -100,6 +102,10 @@ def _round_id() -> int | None:
     return (current_edit_context() or {}).get("round")
 
 
+def _tool_call_id() -> str | None:
+    return (current_edit_context() or {}).get("tool_call_id")
+
+
 def lookup(path: Path | str) -> FileState | None:
     return _cache().get(path)
 
@@ -121,15 +127,14 @@ def record_read(
     previous = _cache().get(target)
     # A full read stays valid while the file version is unchanged, even if the
     # model later reads a smaller page. Overwriting still needs a full view.
-    full = bool(
-        full_read
-        or (
-            previous is not None
-            and previous.full_read
-            and previous.mtime_ns == stat.st_mtime_ns
-            and previous.size == stat.st_size
-        )
+    previous_full = (
+        previous is not None and previous.full_read
+        and previous.mtime_ns == stat.st_mtime_ns and previous.size == stat.st_size
     )
+    call_id = _tool_call_id()
+    full_read_call_id = call_id if full_read else None
+    if not full_read and previous_full:
+        full_read_call_id = previous.full_read_call_id
     _cache().put(
         target,
         FileState(
@@ -137,9 +142,11 @@ def record_read(
             size=stat.st_size,
             start_line=start_line,
             end_line=end_line,
-            full_read=full,
+            full_read=full_read or previous_full,
             turn_id=_turn_id(),
             round_id=_round_id(),
+            tool_call_id=call_id,
+            full_read_call_id=full_read_call_id,
         ),
     )
 
@@ -161,6 +168,8 @@ def record_written(path: Path | str) -> None:
             full_read=True,
             turn_id=_turn_id(),
             round_id=_round_id(),
+            tool_call_id=_tool_call_id(),
+            full_read_call_id=_tool_call_id(),
         ),
     )
 
@@ -196,24 +205,28 @@ def is_unchanged(path: Path | str, *, start_line: int, end_line: int) -> bool:
     return state.mtime_ns == stat.st_mtime_ns and state.size == stat.st_size
 
 
-def invalidate(path: Path | str) -> None:
-    """Drop a path from every cache (used when its read result is pruned).
+def invalidate(path: Path | str, *, tool_call_id: str | None = None, root: Path | None = None) -> None:
+    """Expire read state backed by a pruned tool result.
 
-    The argument may be the model-facing relative path rather than the
-    resolved path, so match both the resolved key and a path suffix.
+    With a workspace root, resolve relative tool arguments there. Callers
+    without a root can match a model-facing path by its suffix.
     """
-    raw = os.path.normcase(str(path).replace("\\", "/")).lstrip("./")
+    raw = os.path.normcase(str(path)).replace("\\", "/").lstrip("./")
     if not raw:
         return
     try:
-        resolved = _key(path)
-    except (OSError, ValueError, TypeError):
+        resolved = _key(root / path if root is not None else path).replace("\\", "/")
+    except (OSError, ValueError, TypeError, RuntimeError):
         return
     for cache in (_default, *_sessions.values()):
-        for key in list(cache._items):
+        for key, state in list(cache._items.items()):
             normalized = key.replace("\\", "/")
-            if normalized == resolved or normalized.endswith(raw) or normalized.endswith("/" + raw):
+            if normalized != resolved and (root is not None or not normalized.endswith("/" + raw)):
+                continue
+            if tool_call_id is None or state.tool_call_id in {None, tool_call_id}:
                 cache._items.pop(key, None)
+            elif state.full_read and state.full_read_call_id == tool_call_id:
+                cache._items[key] = replace(state, full_read=False, full_read_call_id=None)
 
 
 def reset_session(session_id: str | None = None) -> None:

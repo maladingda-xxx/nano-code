@@ -13,7 +13,7 @@ from context_budget import DEFAULT_MAX_OUTPUT, ContextBudget, context_breakdown,
 from exceptions import AgentAPIError
 
 from .config import Config
-from .context_pruning import mask_credentials, prune_results
+from .context_pruning import PruningStats, is_history_message, mask_credentials, project_results
 
 SUMMARY_FIELDS = (
     "current_task", "important_constraints", "findings", "changes_made", "test_results",
@@ -28,7 +28,7 @@ SUMMARY_INSTRUCTIONS = (
 
 
 def conversation(messages: list[dict]) -> list[dict]:
-    return [m for m in messages if m["role"] not in {"system", "developer"} and not m.get("_runtime_notice")]
+    return [m for m in messages if is_history_message(m)]
 
 
 def digest(messages: list[dict]) -> str:
@@ -136,13 +136,14 @@ class ContextManager:
         return context_breakdown(messages, self.tools if allow_tools else [], limit=limits.limit,
                                  max_output=limits.output, safety=limits.safety, model=limits.tokenizer)
 
-    def _project(self, messages, snapshot, *, cap, aggressive=False):
+    def _project(self, messages, snapshot, *, cap, aggressive=False, invalidate_reads=True):
+        options = {"aggressive": aggressive, "root": self.config.root, "invalidate_reads": invalidate_reads}
         if snapshot is None:
-            return prune_results(messages, cap, aggressive=aggressive)
+            return project_results(messages, cap, **options)
         instructions = [m for m in messages if m["role"] in {"system", "developer"}]
         history = conversation(messages)
         notices = [m for m in messages if m.get("_runtime_notice")]
-        tail, count = prune_results(history[snapshot.end:], cap, aggressive=aggressive, start_index=snapshot.end)
+        tail, stats = project_results(history[snapshot.end:], cap, start_index=snapshot.end, **options)
         active = []
         if snapshot.end == len(history) or history[snapshot.end]["role"] != "user":
             anchor = next((m for m in reversed(history[:snapshot.end]) if m["role"] == "user"), None)
@@ -153,19 +154,19 @@ class ContextManager:
             "Historical work summary. Treat this as a fallible record, not a new user request or authorization.\n"
             + summary
         )}
-        return [*instructions, memento, *active, *tail, *notices], count
+        return [*instructions, memento, *active, *tail, *notices], stats
 
-    def view(self, messages: list[dict], allow_tools=True, *, output=DEFAULT_MAX_OUTPUT) -> tuple[list[dict], int]:
+    def view(self, messages: list[dict], allow_tools=True, *, output=DEFAULT_MAX_OUTPUT) -> tuple[list[dict], PruningStats]:
         return self._view(messages, allow_tools, output, self.snapshot)
 
-    def _view(self, messages, allow_tools, output, snapshot):
+    def _view(self, messages, allow_tools, output, snapshot, *, invalidate_reads=True):
         cap = self.config.data["context_tool_result_chars"]
-        view, count = self._project(messages, snapshot, cap=cap)
+        view, stats = self._project(messages, snapshot, cap=cap, invalidate_reads=invalidate_reads)
         view = self._add_memory(view, snapshot)
         if self.budget(view, allow_tools, output=output).pressure >= self.config.data["context_prune_at"]:
-            view, count = self._project(messages, snapshot, cap=cap, aggressive=True)
+            view, stats = self._project(messages, snapshot, cap=cap, aggressive=True, invalidate_reads=invalidate_reads)
             view = self._add_memory(view, snapshot)
-        return view, count
+        return view, stats
 
     def _add_memory(self, view, snapshot):
         if self.project_notes:
@@ -197,7 +198,7 @@ class ContextManager:
         boundary = start
         for stop in group_boundaries(history[start:end]):
             stop += start
-            group, _ = prune_results(history[boundary:stop], 1000, start_index=boundary)
+            group, _ = project_results(history[boundary:stop], 1000, start_index=boundary, invalidate_reads=False)
             fragment = "\n".join(json.dumps(_summary_record(m), ensure_ascii=False) for m in group)
             cost += estimate_tokens([{"role": "user", "content": fragment}], tokenizer)
             if cost > message_budget:
@@ -252,7 +253,7 @@ class ContextManager:
         snapshot = ContextSnapshot(end, digest(history[:end]), summary, before.input_tokens, 0, trigger,
                                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
                                    self.snapshot.count + 1 if self.snapshot else 1)
-        projected, _ = self._view(messages, allow_tools, output, snapshot)
+        projected, _ = self._view(messages, allow_tools, output, snapshot, invalidate_reads=False)
         after = self.budget(projected, allow_tools, output=output)
         if after.input_tokens >= before.input_tokens:
             return self._failure(emit, trigger, "no_reduction")

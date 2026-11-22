@@ -34,6 +34,7 @@ from .effort_picker import pick_effort
 from .login_picker import configure_provider
 from .mascot import mascot
 from .model_picker import effort_choices, pick_model
+from .python_lsp import diagnostic_line
 from .reasoning import CATALOG_EFFORT_PROVIDERS
 from .work_status import WorkStatus
 
@@ -227,6 +228,15 @@ class Renderer:
                 self.console.print(Text("  ⎿  " + (lines[0][:160] if lines else status), style="dim" if ok else WARNING))
                 if len(lines) > 1:
                     self.console.print(Text(f"     +{len(lines)-1} lines · /output 展开", style="dim"))
+        elif kind == "python_diagnostics":
+            path = event["path"]
+            items = event["diagnostics"]
+            if items:
+                self.console.print(Text("  Python 静态诊断", style=WARNING))
+                for item in items:
+                    self.console.print(Text("    " + safe_text(diagnostic_line(path, item)), style=WARNING))
+            else:
+                self.console.print(Text(f"  Python 静态诊断已清除 · {safe_text(path)}", style="dim"))
         elif kind in {"error", "notice", "recovery_error"}:
             self.console.print(Text("  " + safe_text(event["text"]), style=WARNING if kind == "notice" else ERROR))
         elif kind == "context_compaction" and event["trigger"] == "automatic":

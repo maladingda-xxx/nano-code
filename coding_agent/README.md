@@ -61,13 +61,22 @@ nano-code --env-file /path/to/nano.env
 
 ## 上下文管理
 
-交互、脚本、SDK 和 RPC 共用请求上下文。每次请求估算消息、工具定义和协议开销，为模型回复预留空间。安装可选依赖 `coding-agent[tiktoken]` 后，可对支持的 OpenAI 模型使用对应的本地 tokenizer，其余使用标明来源的 UTF-8 启发式估算。输入达到可用输入预算的 60% 时，优先缩减较旧的工具结果。达到 75% 时，可对已完成的历史生成工作摘要，每个用户轮次最多发起一次自动摘要请求。超过本地预算时继续裁剪完整轮次和工具批次，必要内容仍放不下时返回 `context_budget_exceeded`。
+交互、脚本、SDK 和 RPC 共用请求上下文。每次请求估算消息、工具定义和协议开销，为模型回复预留空间。安装可选依赖 `coding-agent[tiktoken]` 后，可对支持的 OpenAI 模型使用对应的本地 tokenizer，其余使用标明来源的 UTF-8 启发式估算。输入达到可用输入预算的 60% 时，较旧批次中的长读取和搜索结果会折叠为操作、范围及回读引用。最近一批沿用常规长度限制，命令输出继续保留退出状态和失败证据。折叠后的请求达到 75% 时，可对已完成的历史生成工作摘要，每个用户轮次最多发起一次自动摘要请求。超过本地预算时继续裁剪完整轮次和工具批次，必要内容仍放不下时返回 `context_budget_exceeded`。
 
 压缩视图保留当前用户原话、近期消息、配套工具调用和结构化工作摘要。摘要覆盖任务、约束、发现、修改、测试、决策、剩余工作、相关文件与风险。实际修改路径、最近验证结果和待核查操作来自本地执行记录，任务清单保留为模型登记的状态。摘要失败、缩减不足或写入失败时沿用已有视图。摘要请求计入 `MAX_MODEL_REQUESTS`。
 
 恢复同一 UID 时，Nano Code 校验摘要对应的原始历史范围。用 `/export session.json` 导出原始消息，或在模型遇到裁剪提示时让它调用 `read_tool_output`。回读使用字符偏移和常见凭据遮盖。保存的工具原文受原有执行上限与文件分页限制，SQLite 及导出文件仍可能包含敏感文本。既有旧会话和以前生成的归档均可以按原 ID 打开。
 
-项目记忆保存在 `.nano/MEMORY.md`，可用 `/memory <内容>` 追加。按当前任务词汇挑选少量 Markdown 章节，可在标题中标明 `[verified 2026-10-01]`、`[inferred]` 或 `[stale]`。前两类标签和日期随正文保留，显式过期章节跳过。
+项目记忆保存在 `.nano/MEMORY.md`，可用 `/memory <内容>` 追加。Nano Code 本地选取最多三个相关章节，优先匹配任务中的路径、标题和描述。可在章节标题后写入下面的可选字段。路径使用仓库相对路径，可用逗号列出文件或目录。旧格式继续按原有词汇规则匹配，标题中的 `[stale]`、`[obsolete]`、`[过期]` 或 `[废弃]` 会排除整个章节。
+
+```markdown
+## Checkout 请求重试
+Description: 结账请求的退避和重试约定
+Paths: src/checkout, tests/checkout
+Updated: 2026-11-19
+
+瞬态故障使用共享退避策略。
+```
 
 下列设置可写入 `~/.nano-code/settings.json` 或受信任的项目设置。
 
@@ -82,6 +91,21 @@ nano-code --env-file /path/to/nano.env
 | `anthropic_prompt_cache` | 默认关闭。开启后，Anthropic 官方 HTTPS 直连为系统提示及其前面的工具定义声明临时缓存。 |
 
 OpenAI 和 DeepSeek 的隐式缓存受供应商条件与重复前缀影响。Nano Code 保持工具定义顺序和系统提示前缀稳定，并汇总实际返回的缓存读取、缓存写入和推理用量。缓存命中仍占逻辑输入窗口。服务端没返回的细分字段省略。旧版 `nano-code-legacy` 入口保留请求级预算及裁剪行为。
+
+## Python 静态诊断
+
+项目可为 `.py` 和 `.pyi` 的内置编辑与写入启用 Pyright。先安装项目使用的 Pyright，在 `.nano/settings.local.json` 配置 stdio 命令，然后执行 `/trust` 并重启 Nano Code。Windows 上用 `node` 加脚本路径启动，脚本路径相对于仓库根目录。 [Pyright 安装说明](https://github.com/microsoft/pyright/blob/main/docs/installation.md)
+
+```json
+{
+  "python_lsp": {
+    "argv": ["node", "./node_modules/pyright/langserver.index.js", "--stdio"],
+    "timeout": 3
+  }
+}
+```
+
+语言服务在会话中按需启动，处理最多 1 MB 的 UTF-8 Python 源文件。每个编辑批次最多等待 `timeout` 秒，默认 3 秒。逾时后，当前轮的后续模型请求仍可接收匹配编辑版本的诊断。交互终端显示变动的诊断，JSON 事件提供对应的 1 起始行列、严重级别、规则与说明。会话结束或取消时停止服务。验证状态继续取自实际验证命令的退出码。
 
 ## 会话与恢复
 
@@ -100,7 +124,7 @@ OpenAI 和 DeepSeek 的隐式缓存受供应商条件与重复前缀影响。Nan
 | `/restore <轮次 ID>` | 预览并恢复指定轮次仍可恢复的文件；冲突文件保留当前内容。 |
 | `/recover`、`/recover <轮次 ID>` | 列出未结束的轮次，或恢复指定轮次的对话。 |
 | `/save <名称>`、`/load <名称>`、`/sessions` | 保存、恢复和列出会话；列表显示稳定会话 UID。 |
-| `/context`、`/context stats` | 查看下次请求的估算预算、分项占用、阈值和压缩记录。统计显示本进程用量、裁剪次数与估算误差。 |
+| `/context`、`/context stats` | 查看估算预算、分项占用、阈值和压缩记录。统计显示本进程用量、裁剪次数、累计折叠结果数与估算误差。 |
 | `/compact [重点]` | 手动压缩可归纳的历史，显示压缩前后估算，并保留原始会话。 |
 | `/clear`、`/stats`、`/help`、`/exit` | 清空上下文、查看统计和帮助、退出。 |
 
@@ -120,10 +144,11 @@ nano-code -p '修复失败的测试并验证' --json --allow-command '["python",
 | 事件 | 字段 |
 | --- | --- |
 | `model_request` | `number` 为进程内累计模型请求数，`attempt` 为本次模型调用的尝试序号 |
-| `context_pruning`、`context_compaction` | 工具输出裁剪数量、摘要触发方式、结果和前后估算 |
+| `context_pruning`、`context_compaction` | 裁剪及折叠的工具结果数量、摘要触发方式、结果和前后估算 |
 | `usage` | 服务端报告的增量用量。按供应商实际字段提供缓存与推理统计 |
 | `tool_output` | `stream` 为 `stdout` 或 `stderr`，`text` 是刚收到的输出片段 |
 | `tool_result` | `result` 提供易读文本，`outcome` 提供工具状态、退出码、stdout、stderr、耗时毫秒数和截断标记 |
+| `python_diagnostics` | `path`、`version` 和 `diagnostics` 提供本轮修改文件的版本和静态诊断，空列表表示该文件的上一组诊断已清除 |
 | `turn_end` | `status` 表示完成回复、调用出错或中断。 `reason` 提供具体结束原因，包括工具轮数耗尽和无工具降级。`changes` 提供本轮通过内置文件工具成功编辑或写入的文件及次数，`tool_calls` 为本轮工具调用数 |
 | `turn_end.verification` | 记录本轮最近一次显式验证命令及状态。状态包括 `passed`、`failed`、`not_run`、`inconclusive` 和 `stale` |
 

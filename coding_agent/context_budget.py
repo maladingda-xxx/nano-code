@@ -125,7 +125,7 @@ def _fit_latest_batch(batch: list[dict], available: int, model: str) -> list[dic
     for message in batch:
         if message["role"] == "assistant":
             for call in message.get("tool_calls", ()):
-                calls[call.get("id")] = call.get("function", {})
+                calls[call.get("id")] = call
     max_length = max(
         (len(message["content"]) for message in batch
          if message["role"] in {"assistant", "tool"} and isinstance(message.get("content"), str)),
@@ -175,12 +175,13 @@ def _call_for(tool_message: dict, block: list[dict]) -> dict | None:
             continue
         for call in message.get("tool_calls", ()):
             if call.get("id") == tool_message.get("tool_call_id"):
-                return call.get("function", {})
+                return call
     return None
 
 
-def _invalidate_read(function: dict | None) -> None:
-    if not isinstance(function, dict) or function.get("name") != "read_file":
+def _invalidate_read(call: dict | None) -> None:
+    function = call.get("function", {}) if call else {}
+    if function.get("name") != "read_file":
         return
     try:
         arguments = json.loads(function.get("arguments", "{}"))
@@ -188,7 +189,7 @@ def _invalidate_read(function: dict | None) -> None:
         return
     path = arguments.get("file_path") if isinstance(arguments, dict) else None
     if isinstance(path, str):
-        file_state.invalidate(path)
+        file_state.invalidate(path, tool_call_id=call.get("id"))
 
 
 def fit_request(

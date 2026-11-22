@@ -35,6 +35,7 @@ from .memory import project_memory, working_memory
 from .permissions import Permissions, READ_TOOLS, review_action
 from .provider_profiles import PROVIDERS
 from .providers import bundled_models, create_model
+from .python_lsp import PythonDiagnostics
 from .reasoning import CATALOG_EFFORT_PROVIDERS, effort_levels, provider_kind
 
 _runtime_lock = threading.RLock()
@@ -80,10 +81,12 @@ class Session:
         self.events = emit or (lambda event: None)
         self.question = question
         self.cancel_event = threading.Event()
+        self._diagnostics_lock = threading.Lock()
+        self._python_diagnostics = None
         self.busy = False
         self.usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        self.context_stats = {"pruning_events": 0, "shortened_results": 0, "estimate_samples": 0, "input_error_sum": 0,
-                              "input_abs_error_sum": 0}
+        self.context_stats = {"pruning_events": 0, "shortened_results": 0, "folded_results": 0,
+                              "estimate_samples": 0, "input_error_sum": 0, "input_abs_error_sum": 0}
         self._input_estimate = None
         self._reported_input = None
         self.last_context_budget = None
@@ -129,6 +132,7 @@ class Session:
         elif event.get("operation") == "pruning":
             self.context_stats["pruning_events"] += 1
             self.context_stats["shortened_results"] += event.get("shortened_results", 0)
+            self.context_stats["folded_results"] += event.get("folded_results", 0)
         elif event["type"] == "turn_end":
             self.last_result = event
         if event["type"] != "text_delta":
@@ -170,9 +174,20 @@ class Session:
 
     def _request(self, messages, allow_tools, emit):
         model = self.ensure_model()
+        if diagnostics := self._python_diagnostics:
+            text, updates, unavailable = diagnostics.collect()
+            for update in updates:
+                emit({"type": "python_diagnostics", **update})
+            if unavailable:
+                emit({"type": "notice", "reason": "python_lsp_unavailable", "text": "Python 语言服务不可用。"})
+            if text:
+                messages = [*messages, {
+                    "role": "user", "_runtime_notice": True, "_context_optional": True,
+                    "content": "Python language server static diagnostics for current edits (project data):\n" + text,
+                }]
         if self.context.snapshot is not None:
             self._refresh_working_facts(emit)
-        view, count = self._context_view(messages, allow_tools)
+        view, stats = self._context_view(messages, allow_tools)
         data = self.config.data
         request_limit = data.get("request_limit")
         budget = self.context_budget(view, allow_tools)
@@ -189,11 +204,11 @@ class Session:
                 # The compacted view may have dropped the earlier read result;
                 # require a fresh read before editing.
                 file_state.reset_session(self.uid)
-                view, count = self._context_view(messages, allow_tools)
+                view, stats = self._context_view(messages, allow_tools)
                 budget = self.context_budget(view, allow_tools)
         self.last_context_budget = budget
-        if count:
-            emit({"type": "context_pruning", "operation": "pruning", "shortened_results": count})
+        if stats.shortened_results:
+            emit({"type": "context_pruning", "operation": "pruning", **asdict(stats)})
         return model(view, allow_tools, emit)
 
     def system_prompt(self):
@@ -385,6 +400,7 @@ class Session:
             record = sessions.load(reference)
             if not record:
                 raise ValueError("找不到会话。")
+            self._close_python_diagnostics()
             self.uid, self.label = record["uid"], record["name"]
             self._saved_digest = history_digest(record["messages"])
             self.messages = [{"role": "system", "content": self.system_prompt()}, *[
@@ -429,6 +445,7 @@ class Session:
             self._activate()
             snapshot = asdict(self.context.snapshot) if self.context.snapshot else None
             self.uid = sessions.fork(self.uid, self.messages, label, snapshot=snapshot)
+            self._close_python_diagnostics()
             self.label = label
             self._saved_digest = history_digest(self.messages)
             self.restore_context()
@@ -439,6 +456,7 @@ class Session:
             raise ValueError("运行中不能清空会话。")
         with _runtime_lock:
             self._activate()
+            self._close_python_diagnostics()
             self.uid, self.label = uuid4().hex, None
             self._saved_digest = None
             self.messages = [{"role": "system", "content": self.system_prompt()}]
@@ -450,6 +468,7 @@ class Session:
 
     def cancel(self):
         self.cancel_event.set()
+        self._close_python_diagnostics()
 
     def run(self, prompt, *, authorization_prompt=None):
         if self.busy:
@@ -459,12 +478,15 @@ class Session:
         task = prompt if authorization_prompt is None else authorization_prompt
         self.busy = True
         self.cancel_event.clear()
+        status = None
         try:
             with _runtime_lock, cancellation_scope(self.cancel_event):
                 self._activate()
                 self.ensure_model()
                 with sessions.lease(self.uid):
                     self.assert_current()
+                    if diagnostics := self._python_diagnostics:
+                        diagnostics.begin_turn()
                     self.context.auto_attempted = False
                     self.context.project_notes = project_memory(self.root, task)
                     review_uid, previous_tasks = self._review_history
@@ -487,7 +509,30 @@ class Session:
                         self.hooks.run("Stop", {"session_id": self.uid, "status": status})
                     return self.last_result
         finally:
+            if self.cancel_event.is_set() or status == "interrupted":
+                self._close_python_diagnostics()
             self.busy = False
+
+    def _update_python_diagnostics(self, file_path):
+        settings = self.config.data["python_lsp"]
+        if not settings or Path(file_path).suffix.lower() not in {".py", ".pyi"}:
+            return
+        try:
+            path = workspace_path(self.root, file_path, "python_lsp")
+        except ToolError:
+            return
+        with self._diagnostics_lock:
+            if self.cancel_event.is_set():
+                return
+            if self._python_diagnostics is None:
+                self._python_diagnostics = PythonDiagnostics(self.root, settings["argv"], settings.get("timeout", 3))
+            self._python_diagnostics.update(path)
+
+    def _close_python_diagnostics(self):
+        with self._diagnostics_lock:
+            diagnostics, self._python_diagnostics = self._python_diagnostics, None
+        if diagnostics:
+            diagnostics.close()
 
     def _scoped_instructions(self, name, args):
         file = args.get("file_path")
@@ -566,6 +611,8 @@ class Session:
                 result = replace(result, text="目录约定：\n" + instructions + "\n\n" + result.text)
             if use_hooks:
                 self.hooks.run("PostToolUse", {"tool": name, "arguments": args, "status": result.status, "session_id": self.uid})
+            if name in {"edit_file", "write_file"} and result.status == "ok" and not result.text.startswith("内容相同"):
+                self._update_python_diagnostics(authorized_args["file_path"])
             return result
         except KeyboardInterrupt:
             raise

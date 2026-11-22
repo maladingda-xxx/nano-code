@@ -121,7 +121,8 @@ class AnthropicModel:
                 raise ModelRequestBudgetError("已达到模型请求上限。")
             self.requests_sent += 1
             request = {"type": "model_request", "number": self.requests_sent, "attempt": attempt + 1,
-                       "estimated_input_tokens": estimate.input_tokens, "purpose": purpose}
+                       "estimated_input_tokens": estimate.input_tokens, "max_output_tokens": output,
+                       "purpose": purpose}
             if adjustable:
                 request["effort"] = effort
             emit(request)
@@ -202,9 +203,10 @@ class AnthropicModel:
                 raise ModelResponseError("Anthropic stream error", reason="stream_interrupted")
         if not stopped:
             raise ModelResponseError("Anthropic stream disconnected", reason="incomplete_response")
-        for index, fragment in fragments.items():
-            if fragment:
-                blocks[index]["input"] = json.loads(fragment)
+        if raw.get("stop_reason") != "max_tokens":
+            for index, fragment in fragments.items():
+                if fragment:
+                    blocks[index]["input"] = json.loads(fragment)
         raw["content"] = [blocks[i] for i in sorted(blocks)]
         return raw
 

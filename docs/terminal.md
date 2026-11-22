@@ -45,6 +45,10 @@ nano-code
 
 `/model` 会刷新已登录的 OpenRouter 和 Claude 模型目录，并读取模型公开的推理档位。目录暂时不可用时沿用已有数据。Kimi、DeepSeek、Gemini、Groq 等直连模型按已支持的系列识别档位。当前连接没有可识别的档位时，只使用 `auto`。
 
+`/context` 中的“回复预留”是单次模型请求的常规生成预算。直连 DeepSeek Flash 和 V4 Pro 时，`/effort auto` 使用官方默认的 `high` 思考档。按官方默认值预留 8,192 tokens（`none`）、65,536 tokens（`low` 或 `high`）或 131,072 tokens（`max`），实际预算受上下文和模型配置约束。[DeepSeek API 文档](https://api-docs.deepseek.com/api/create-chat-completion/)
+
+收到输出截断信号时，Nano Code 保留已完成的操作，并自动重试当前模型步骤一次。直连 DeepSeek Flash 和 V4 Pro 时，输入预算允许的情况下会在重试时提高生成上限。任务可跨多轮工具调用执行，`nano-code` 默认允许 64 个工具轮，可用 `--max-turns` 或 `MAX_TOOL_ROUNDS` 调整。
+
 恢复时会检查文件是否仍与 Nano Code 当时写入的内容一致，发现冲突会保留当前文件。可恢复范围包括通过 `edit_file` 和 `write_file` 完成的修改。测试命令、MCP 工具和 hooks 造成的外部变更需要用 Git 或对应系统的记录审阅。对话分支共用项目文件。需要独立修改文件时，请从两个 Git worktree 分别启动。
 
 ## 权限和扩展
@@ -58,6 +62,8 @@ nano-code
 可在用户或受信任的项目设置中配置确切的参数、目录和文件规则。例如 `{"permissions":{"allow":[{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}],"deny":[{"tool":"write_file","path":"deploy/*"}]}}`。项目中的可执行扩展和允许规则需要先使用 `/trust` 绑定当前配置，然后重启。内容修改后需要重新信任。
 
 可用 `nano-code --permission-mode auto` 启动，或在已有会话输入 `/auto`。自动审查可直接处理任务中的常规本地测试。对特定命令可在 `permissions.autoAllow` 中添加精确规则，例如 `{"tool":"execute_command","cwd":".","argv":["python","-m","pytest","-q"]}`，命中时直接放行。显式 `deny` 优先。
+
+若希望本机每次启动 `nano` 或 `nano-code` 时进入 `auto` 模式，可在用户配置文件 `~/.nano-code/settings.json` 中设置 `"permission_mode": "auto"`。
 
 项目 `.nano/skills/<名称>/SKILL.md`、`.claude/skills/<名称>/SKILL.md` 或用户 `~/.nano-code/skills/<名称>/SKILL.md` 可以放可复用流程。`/skills` 查看，`/<名称> 参数` 手动调用。工具可按需加载允许模型调用的 Skill。子代理支持同样位置下的 `agents/<名称>.md`，它们用独立上下文做前台只读调查并返回结果。
 

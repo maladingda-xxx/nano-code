@@ -64,6 +64,24 @@ def run_turn(
             checkpoint(scoped, messages)
         emit(scoped)
 
+    def request_reply(request_messages: list[dict], allow_tools: bool) -> ModelReply:
+        try:
+            return request_model(request_messages, allow_tools, publish)
+        except ModelResponseError as error:
+            if error.reason != "response_truncated":
+                raise
+        check_cancelled()
+        publish({"type": "notice", "reason": "response_truncated",
+                 "text": "单次模型输出已截断，正在从已完成的步骤继续。"})
+        instruction = (
+            "根据已有工具结果继续当前任务。若还需操作，先执行一个小步骤，把大型改动拆成多轮工具调用。"
+            "已经执行的操作无需重复。任务完成后简要报告结果与验证情况。" if allow_tools else
+            "上一次生成被截断。请按原任务要求给出精简、完整的答复，保留关键结果和未完成事项。"
+        )
+        return request_model([*request_messages, {
+            "role": "user", "content": instruction, "_runtime_notice": True, "_output_retry": True,
+        }], allow_tools, publish)
+
     messages.append({"role": "user", "content": prompt})
     status = "completed"
     reason = "reply"
@@ -101,23 +119,22 @@ def run_turn(
             ):
                 remaining = max_tool_rounds - round_number
                 budget_notice_sent = True
-                publish({"type": "notice", "text": f"剩余 {remaining} 个工具轮，提示模型优先提交修改。"})
+                publish({"type": "notice", "text": f"剩余 {remaining} 个工具轮，提示模型优先完成必要工作和验证。"})
                 request_messages = [*messages, {
                     "role": "user",
                     "content": (
-                        f"仅剩 {remaining} 个工具轮。若已定位修改点，请立即提交最小修改；"
-                        "否则基于已有结果给出结论。"
+                        f"仅剩 {remaining} 个工具轮。请优先完成必要的修改和验证，并如实报告未完成事项。"
                     ),
                     "_runtime_notice": True,
                 }]
             publish({"type": "model_start", "round": round_number + 1})
             try:
-                reply = request_model(request_messages, allow_tools, publish)
+                reply = request_reply(request_messages, allow_tools)
             except AgentAPIError as error:
                 if not allow_tools or not error.allow_fallback:
                     raise
                 publish({"type": "notice", "text": "模型调用失败，正在尝试无工具模式。"})
-                reply = request_model(messages, False, publish)
+                reply = request_reply(messages, False)
                 allow_tools = False
                 reason = "model_fallback"
             if reply.tool_calls and not allow_tools:

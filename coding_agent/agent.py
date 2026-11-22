@@ -796,6 +796,8 @@ def main(argv: list[str] | None = None) -> int:
             streaming=os.getenv("STREAMING_ENABLED", "true").lower() in ("true", "1", "yes"),
             max_attempts=attempts, retry_delay=retry_delay, tools=TOOLS, context_limit=context_limit,
             request_limit=request_limit, disable_thinking=official_deepseek,
+            vendor="deepseek" if official_deepseek else None,
+            effort="none" if official_deepseek else None,
         )
     except ValueError as error:
         error_console.print(Text(f"配置错误：{error}", "red"))

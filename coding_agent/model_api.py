@@ -13,6 +13,7 @@ from cancellation import check_cancelled
 from exceptions import AgentAPIError, ModelRequestBudgetError, ModelResponseError
 
 TOOL_MARKUP_MARKERS = ("<｜｜DSML｜｜", "<|tool_call|>", "<tool_calls>")
+DEEPSEEK_MODELS = {"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"}
 
 
 def _chat_reasoning_source(vendor, name):
@@ -21,7 +22,9 @@ def _chat_reasoning_source(vendor, name):
     return None
 
 
-def chat_output_target(vendor, name):
+def chat_output_target(vendor, name, effort=None):
+    if vendor == "deepseek" and name in DEEPSEEK_MODELS:
+        return {"none": 8_192, "max": 131_072}.get(effort, 65_536)
     return 16384 if _chat_reasoning_source(vendor, name) else DEFAULT_MAX_OUTPUT
 
 
@@ -176,11 +179,19 @@ class ChatModel:
 
     @property
     def output_target(self):
-        return chat_output_target(self.vendor, self.name)
+        return chat_output_target(self.vendor, self.name, self.effort)
 
     @property
     def reasoning_source(self):
         return _chat_reasoning_source(self.vendor, self.name)
+
+    @property
+    def deepseek_effort(self):
+        if not self.disable_thinking or self.effort == "none":
+            return None
+        if self.vendor == "deepseek" and self.name in DEEPSEEK_MODELS and self.effort in (None, "auto"):
+            return "high"
+        return self.effort
 
     def _request_messages(self, messages, tools):
         prepared = []
@@ -205,7 +216,7 @@ class ChatModel:
                         message["reasoning_details"] = details
                     elif isinstance(text := reasoning.get("reasoning"), str):
                         message["reasoning"] = text
-                elif self.disable_thinking and self.effort and tools:
+                elif self.deepseek_effort and tools:
                     if source is not None:
                         message.pop("reasoning_content", None)
                     message.setdefault("reasoning_content", "")
@@ -227,10 +238,18 @@ class ChatModel:
     def _create(self, emit: EventHandler, **kwargs: Any) -> Any:
         tools = kwargs.get("tools") or []
         purpose = kwargs.pop("purpose", "turn")
-        limit, max_output, safety, tokenizer = self._budget_options(kwargs.pop("max_tokens"))
+        target = kwargs.pop("max_tokens")
+        messages = self._request_messages(kwargs["messages"], tools)
+        limit, max_output, safety, tokenizer = self._budget_options(target)
+        if (self.vendor == "deepseek" and self.name in DEEPSEEK_MODELS
+                and any(message.get("_output_retry") for message in messages)):
+            _, retry_output, _, _ = self._budget_options(target * 2)
+            retry_budget = context_breakdown(messages, tools, limit=limit, max_output=retry_output,
+                                             safety=safety, model=tokenizer)
+            if retry_budget.remaining >= 0:
+                max_output = retry_output
         kwargs["messages"], max_tokens = fit_request(
-            self._request_messages(kwargs["messages"], tools), tools, limit=limit,
-            max_output=max_output, emit=emit, safety=safety, model=tokenizer,
+            messages, tools, limit=limit, max_output=max_output, emit=emit, safety=safety, model=tokenizer,
         )
         estimate = context_breakdown(kwargs["messages"], tools, limit=limit, model=tokenizer)
         openai_reasoning = self.vendor == "openai" and self.name.startswith(("gpt-5", "o1", "o3", "o4"))
@@ -251,11 +270,12 @@ class ChatModel:
                 extra["reasoning_effort"] = self.effort
         if self.vendor == "xai" and self.name == "grok-4.3":
             kwargs["reasoning_effort"] = "none"
+        effort = self.effort
         if self.disable_thinking:
-            # The disabled mode is the previous default for official DeepSeek.
-            kwargs["extra_body"] = {"thinking": {"type": "enabled" if self.effort else "disabled"}}
-            if self.effort:
-                kwargs["extra_body"]["reasoning_effort"] = self.effort
+            effort = self.deepseek_effort
+            kwargs["extra_body"] = {"thinking": {"type": "enabled" if effort else "disabled"}}
+            if effort:
+                kwargs["extra_body"]["reasoning_effort"] = effort
         if kwargs.get("stream") and self.stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
         attempts = 1 if purpose == "compaction" else self.max_attempts
@@ -265,9 +285,10 @@ class ChatModel:
                 raise ModelRequestBudgetError(f"已达到模型请求上限（{self.request_limit} 次）。")
             self.requests_sent += 1
             request_event = {"type": "model_request", "number": self.requests_sent, "attempt": attempt,
-                             "estimated_input_tokens": estimate.input_tokens, "purpose": purpose}
-            if self.effort:
-                request_event["effort"] = self.effort
+                             "estimated_input_tokens": estimate.input_tokens, "max_output_tokens": max_tokens,
+                             "purpose": purpose}
+            if effort:
+                request_event["effort"] = effort
             emit(request_event)
             try:
                 response = self.client.chat.completions.create(model=self.name, **kwargs)
@@ -334,7 +355,7 @@ class ChatModel:
             message = response.choices[0].message
             self._save_router_reasoning(reply, getattr(message, "reasoning_details", None),
                                         getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None))
-        elif self.reasoning_source or self.disable_thinking and self.effort:
+        elif self.reasoning_source or self.deepseek_effort:
             reply.reasoning_content = getattr(response.choices[0].message, "reasoning_content", None)
             reply.reasoning_source = self.reasoning_source
         if reply.text:
@@ -370,7 +391,7 @@ class ChatModel:
                 delta = choice.delta
                 if delta is None:
                     continue
-                if (self.reasoning_source or self.disable_thinking and self.effort) and getattr(delta, "reasoning_content", None):
+                if (self.reasoning_source or self.deepseek_effort) and getattr(delta, "reasoning_content", None):
                     reasoning.append(delta.reasoning_content)
                 if self.vendor == "openrouter":
                     details = getattr(delta, "reasoning_details", None)

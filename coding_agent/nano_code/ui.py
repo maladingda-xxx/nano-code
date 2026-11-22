@@ -290,8 +290,8 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
     closing = False
     command_running = False
 
-    def enqueue(text, *, authorization_prompt=None):
-        prompts.put_nowait((text, authorization_prompt, time.monotonic()))
+    def enqueue(text, *, authorization_prompt=None, echo=False):
+        prompts.put_nowait((text, authorization_prompt, time.monotonic(), echo))
 
     def cancel_work():
         session.cancel()
@@ -523,13 +523,15 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
 
     async def run_prompts():
         while True:
-            text, authorization_prompt, submitted = await prompts.get()
+            text, authorization_prompt, submitted, echo = await prompts.get()
             work.start(submitted)
             renderer.started = submitted
             prompt.app.invalidate()
             try:
-                await print_above(lambda: renderer.console.print(Text.assemble(
-                    ("❯ ", f"bold {ACCENT}"), (safe_text(text), "bold"))))
+                # PromptSession leaves typed submissions in the terminal history.
+                if echo:
+                    await print_above(lambda: renderer.console.print(Text.assemble(
+                        ("❯ ", f"bold {ACCENT}"), (safe_text(text), "bold"))))
                 if work.cancelling:
                     continue
                 from .commands import expand_references
@@ -550,7 +552,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
     consumer = asyncio.create_task(consume_events())
     worker = asyncio.create_task(run_prompts())
     if initial and not is_login_command(initial):
-        enqueue(initial)
+        enqueue(initial, echo=True)
     try:
         with create_app_session(input=terminal_input, output=terminal_output), patch_stdout(raw=True):
             while not closing:
@@ -668,7 +670,7 @@ async def interactive(session, initial=None, *, terminal_input=None, terminal_ou
                                 reply = await asyncio.to_thread(execute_command, session, command, renderer,
                                                                 console=Console(highlight=False), running=running)
                                 if isinstance(reply, str) and reply:
-                                    enqueue(reply, authorization_prompt=command)
+                                    enqueue(reply, authorization_prompt=command, echo=True)
                             except (Exception, KeyboardInterrupt) as error:
                                 renderer.console.print(Text(str(error) or "已取消。", style=ERROR))
                             finally:

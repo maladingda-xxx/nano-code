@@ -464,6 +464,40 @@ def test_print_entry_point_reports_json_and_persists(project, monkeypatch, capsy
         assert session.messages[-1]["content"] == "Visible result."
 
 
+def test_terminal_displays_submitted_prompt_once(project, capsys):
+    initial = "Initial question"
+    typed = "Follow-up question"
+    output = io.StringIO()
+
+    class PromptOutput(DummyOutput):
+        def write(self, data):
+            output.write(data)
+
+    async def exercise():
+        with create_pipe_input() as pipe, Session(project, model=lambda *_: ModelReply(text="Done.")) as session:
+            terminal = asyncio.create_task(interactive(
+                session, initial, terminal_input=pipe, terminal_output=PromptOutput(),
+            ))
+            try:
+                pipe.send_text(typed + "\r")
+                async with asyncio.timeout(15):
+                    while sum(event["type"] == "turn_end" for event in session.transcript) < 2:
+                        await asyncio.sleep(0.02)
+                pipe.send_text("/exit\r")
+                assert await asyncio.wait_for(terminal, timeout=10) == 0
+                assert [message["content"] for message in session.messages if message["role"] == "user"] == [initial, typed]
+            finally:
+                if not terminal.done():
+                    terminal.cancel()
+                    await asyncio.gather(terminal, return_exceptions=True)
+
+    asyncio.run(exercise())
+    printed = capsys.readouterr().out
+    assert printed.count(initial) == 1
+    assert typed in output.getvalue()
+    assert typed not in printed
+
+
 def test_terminal_accepts_prompt_approval_and_exit(project, capsys):
     replies = iter([ModelReply(tool_calls=[call("write_file", file_path="result.txt", content="ok")]),
                     ModelReply(text="Done.")])

@@ -22,6 +22,7 @@ DEFAULTS = {
     "streaming": True, "temperature": 0.3, "theme": "dark",
     "top_p": 1.0, "max_retries": 3, "retry_base_delay": 0.5,
     "permissions": {"allow": [], "deny": [], "autoAllow": []}, "mcpServers": {}, "hooks": {},
+    "python_lsp": {},
 }
 MODE_CYCLE = ("default", "acceptEdits", "plan", "auto")
 MODES = (*MODE_CYCLE, "dontAsk")
@@ -138,6 +139,16 @@ class Config:
         for key in ("permissions", "hooks", "mcpServers"):
             if not isinstance(self.data[key], dict):
                 raise ValueError(f"{key} 必须是对象")
+        lsp = self.data["python_lsp"]
+        if not isinstance(lsp, dict):
+            raise ValueError("python_lsp 必须是对象。")
+        if lsp:
+            argv, timeout = lsp.get("argv"), lsp.get("timeout", 3)
+            if (not isinstance(argv, list) or not argv
+                    or not all(isinstance(arg, str) and "\0" not in arg for arg in argv)
+                    or not argv[0].strip() or Path(argv[0]).suffix.lower() in {".cmd", ".bat"}
+                    or type(timeout) not in {int, float} or not 0.1 <= timeout <= 10):
+                raise ValueError("python_lsp 需要可执行文件及参数数组 argv，timeout 须在 0.1 到 10 秒之间。")
         for key in ("allow", "deny", "autoAllow"):
             if not isinstance(self.data["permissions"].get(key, []), list):
                 raise ValueError(f"permissions.{key} 必须是数组")

@@ -13,7 +13,9 @@ from agent_core import ModelReply, run_turn
 from context_budget import context_breakdown, estimate_tokens, fit_request
 from nano_code.config import Config
 from nano_code.context import ContextManager, SUMMARY_FIELDS
-from nano_code.runtime import schema
+from nano_code.context_pruning import read_output
+from nano_code.runtime import EXTRA_TOOLS, schema
+from tools import TOOLS as BUILTIN_TOOLS
 
 WINDOW = 20000
 TOOLS = [schema("execute_command", "Return the log from a fixed test suite.",
@@ -38,11 +40,13 @@ def evaluates(name, rounds, log_length, manager):
     estimated_input = 0
     estimated_output = 0
     requests = 0
+    summary_requests = 0
     attempted_operations = set()
 
     def summarize(summary_messages, emit):
-        nonlocal estimated_input, estimated_output, requests
+        nonlocal estimated_input, estimated_output, requests, summary_requests
         requests += 1
+        summary_requests += 1
         estimated_input += context_breakdown(summary_messages, [], limit=WINDOW, model="unknown").input_tokens
         summary = {key: "Unknown" for key in SUMMARY_FIELDS}
         summary["current_task"] = "Identify the exact failing test in each group."
@@ -98,6 +102,104 @@ def evaluates(name, rounds, log_length, manager):
         "task": name, "passed": accepted, "estimated_input_tokens": estimated_input,
         "estimated_output_tokens": estimated_output, "requests": requests, "tool_calls": calls,
         "repeated_operations": repeated, "elapsed_ms": round((perf_counter() - started) * 1000, 2),
+        "repeated_file_reads": 0, "readbacks": 0, "summary_requests": summary_requests,
+        "compactions": sum(e["type"] == "context_compaction" and e["status"] == "completed" for e in events),
+        "cache_read_tokens": None, "api_cost": None,
+    }
+
+
+def mixed_tool_history(config):
+    names = {"read_file", "search_workspace", "execute_command", "read_tool_output"}
+    tools = [tool for tool in [*BUILTIN_TOOLS, *EXTRA_TOOLS] if tool["function"]["name"] in names]
+    manager = ContextManager(config, tools)
+    history = [{"role": "system", "content": "Report the original setting and the exact failed test."}]
+    operations = [
+        [("read_file", {"file_path": "settings.py"}), ("execute_command", {"argv": ["fixture"]})],
+        *[[
+            ("search_workspace", {"query": f"setting_{i}", "dir_path": "src"}),
+            ("read_file", {"file_path": f"src/module_{i}.py"}),
+        ] for i in range(1, 8)],
+    ]
+    failure, setting = failure_marker(0), "DEFAULT_POOL_SIZE = 37"
+    readback = re.compile(r"\[read_tool_output reference (\d+)\]")
+    dispatched = []
+    events = []
+    batches = requests = summary_requests = estimated_input = estimated_output = 0
+
+    def summarize(messages, emit):
+        nonlocal requests, summary_requests, estimated_input, estimated_output
+        requests += 1
+        summary_requests += 1
+        estimated_input += manager.budget(messages, False).input_tokens
+        summary = dict.fromkeys(SUMMARY_FIELDS, "Unknown")
+        summary["current_task"] = "Report the original setting and exact failed test."
+        transcript = "\n".join(m["content"] for m in messages)
+        summary["findings"] = "\n".join(value for value in (setting, failure) if value in transcript) or "Unknown"
+        if reference := readback.search(transcript):
+            summary["relevant_files"] = reference[0]
+        text = json.dumps(summary)
+        estimated_output += estimate_tokens([{"role": "assistant", "content": text}], "unknown")
+        return text
+
+    def request(messages, allow_tools, emit):
+        nonlocal batches, requests, estimated_input, estimated_output
+        view, _ = manager.view(messages, allow_tools)
+        if manager.budget(view, allow_tools).pressure >= config.data["context_compact_at"]:
+            manager.compact(messages, summarize, emit, lambda _: None, trigger="automatic", allow_tools=allow_tools)
+            view, _ = manager.view(messages, allow_tools)
+        active = tools if allow_tools else []
+        fitted, _ = fit_request(view, active, limit=WINDOW, max_output=4096, emit=emit,
+                                safety=config.model_budget().safety, model="unknown")
+        requests += 1
+        estimated_input += manager.budget(fitted, allow_tools).input_tokens
+        if batches < len(operations):
+            pending = operations[batches]
+            batches += 1
+        else:
+            visible = "\n".join(m.get("content") or "" for m in fitted)
+            retrieved = any(name == "read_tool_output" for name, _ in dispatched)
+            if setting in visible or retrieved or not allow_tools:
+                text = "\n".join(value for value in (setting, failure) if value in visible) or "Evidence unavailable."
+                estimated_output += estimate_tokens([{"role": "assistant", "content": text}], "unknown")
+                return ModelReply(text=text)
+            reference = next((readback.search(m.get("content") or "") for m in fitted
+                              if m.get("tool_call_id") == "mixed-1-0"), None)
+            if reference is None and manager.snapshot:
+                reference = readback.search(manager.snapshot.summary["relevant_files"])
+            pending = ([("read_tool_output", {"reference": reference[1], "offset": 12, "limit": 80})]
+                       if reference else [("read_file", {"file_path": "settings.py"})])
+        calls = [{"id": f"mixed-{requests}-{index}", "type": "function",
+                  "function": {"name": name, "arguments": json.dumps(args)}}
+                 for index, (name, args) in enumerate(pending)]
+        estimated_output += estimate_tokens([{"role": "assistant", "tool_calls": calls}], "unknown")
+        return ModelReply(tool_calls=calls)
+
+    def dispatch(call):
+        function = call["function"]
+        name, args = function["name"], json.loads(function["arguments"])
+        dispatched.append((name, args))
+        rows = "routine fixture data 0123456789\n" * 42
+        if name == "read_tool_output":
+            return read_output(history, **args)
+        if name == "execute_command":
+            return f"Exit code: 1\n{rows}{failure}\n{rows}1 failed"
+        if args.get("file_path") == "settings.py":
+            return f"# settings\n\n{setting}\n{rows}{rows}"
+        return rows * 2
+
+    started = perf_counter()
+    status = run_turn(history, "Find the default pool size and initial failed test.", request_model=request,
+                      dispatch=dispatch, emit=events.append, max_tool_rounds=len(operations) + 3)
+    reads = [args["file_path"] for name, args in dispatched if name == "read_file"]
+    return {
+        "task": "mixed_tool_history",
+        "passed": status == "completed" and all(value in history[-1]["content"] for value in (setting, failure)),
+        "estimated_input_tokens": estimated_input, "estimated_output_tokens": estimated_output,
+        "requests": requests, "tool_calls": len(dispatched),
+        "repeated_file_reads": len(reads) - len(set(reads)),
+        "readbacks": sum(name == "read_tool_output" for name, _ in dispatched),
+        "summary_requests": summary_requests,
+        "elapsed_ms": round((perf_counter() - started) * 1000, 2),
         "compactions": sum(e["type"] == "context_compaction" and e["status"] == "completed" for e in events),
         "cache_read_tokens": None, "api_cost": None,
     }
@@ -113,6 +215,7 @@ def main():
         tasks = (("short", 1, 2), ("long_tool_loop", 9, 95))
         baseline = [evaluates(*task, manager=None) for task in tasks]
         managed = [evaluates(*task, manager=ContextManager(config, TOOLS)) for task in tasks]
+        managed.append(mixed_tool_history(config))
     print(json.dumps({"mode": "offline_scripted", "baseline": baseline, "managed": managed}, indent=2))
     return 0 if all(result["passed"] for result in [*baseline, *managed]) else 1
 
